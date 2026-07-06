@@ -1,0 +1,6 @@
+# per-machine config (paths, creds) — copy from config.example.sh
+config.sh
+
+# nothing else here should be committed
+*.log
+.DS_Store

@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# avoca-dev — a local development database for avoca-next, without touching prod.
+#
+# Stands up a local Supabase stack, mirrors prod's SCHEMA (no data / no PII),
+# points a worktree's env at it, and gives you a one-command seamless dev loop.
+# Everything is reversible; prod is only ever read (schema dump), never written.
+#
+#   avoca-dev setup                 # one-time: stand up the local DB (schema-only mirror)
+#   avoca-dev seed                  # load synthetic test fixtures + a login user
+#   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
+#   avoca-dev db setprod [worktree] # revert it to the PROD db
+#   avoca-dev db status  [worktree] # show which db each app is on
+#   avoca-dev up         [worktree] # seamless: point local + drop stale bundle + pnpm dev
+#   avoca-dev oauth <client-id> <secret>   # wire Google sign-in locally (needs a stack restart)
+#   avoca-dev trim                  # cut the Supabase stack to the ~7 containers we use
+#   avoca-dev status                # show the stack + db + worktree pointers
+#
+# Config: copy config.example.sh -> config.sh and edit, or override any var via env.
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Config (env overrides > config.sh > defaults) ─────────────────────────
+[ -f "$SELF_DIR/config.sh" ] && . "$SELF_DIR/config.sh"
+: "${AVOCA_NEXT_DIR:=$HOME/code/lazer/avoca/avoca-next}"                 # canonical clone
+: "${WORKTREES_DIR:=$HOME/code/lazer/avoca/avoca-next.worktrees}"        # where worktrees live
+: "${LOCAL_DB_DIR:=$HOME/code/lazer/avoca/avoca-local-db}"              # supabase-local home
+: "${APP_SCHEMAS:=public,crm_service_titan,twilio}"                      # schemas to mirror
+: "${PROD_PROJECT_REF:=wmizcewjcybhvkpwpmim}"                            # prod supabase ref
+: "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # source of PROD db url (read-only)
+: "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
+: "${LOGIN_PASSWORD:=avoca-local-dev}"
+: "${LOGIN_NAME:=Local Dev}"
+
+die() { echo "avoca-dev: $*" >&2; exit 1; }
+log() { echo "▸ $*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' on PATH"; }
+
+# Local Supabase status → env-style values (API_URL, ANON_KEY, SERVICE_ROLE_KEY, DB_URL)
+sb_env() { ( cd "$LOCAL_DB_DIR" && supabase status -o env 2>/dev/null || true ); }
+sbval()  { printf '%s\n' "$1" | sed -nE "s/^$2=\"?([^\"]+)\"?\$/\1/p" | head -1; }
+
+# Local Postgres connection (super-user, for schema/seed/grants)
+LP_HOST=127.0.0.1; LP_PORT=54322; LP_USER=postgres; LP_PASS=postgres; LP_DB=postgres
+lsql() { PGPASSWORD="$LP_PASS" psql -h "$LP_HOST" -p "$LP_PORT" -U "$LP_USER" -d "$LP_DB" "$@"; }
+LOCAL_PG_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+
+# Resolve a worktree arg (path | slug | empty=canonical clone) to an absolute path
+resolve_worktree() {
+  local t="${1:-}"
+  if   [ -z "$t" ];                       then echo "$AVOCA_NEXT_DIR"
+  elif [ -d "$t/apps/web" ];              then ( cd "$t" && pwd )
+  elif [ -d "$WORKTREES_DIR/$t/apps/web" ]; then echo "$WORKTREES_DIR/$t"
+  else die "worktree not found: '$t' (looked in $WORKTREES_DIR/)"; fi
+}
+
+# LOCAL / prod / - for a given .env.local (by its effective NEXT_PUBLIC_SUPABASE_URL)
+ptr_tag() {
+  local f="$1"; [ -f "$f" ] || { echo "-"; return; }
+  local u; u="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+  case "$u" in *127.0.0.1*|*localhost*) echo LOCAL;; "" ) echo "-";; *) echo prod;; esac
+}
+
+# ── setup: stand up the local DB as a schema-only mirror of prod ──────────
+cmd_setup() {
+  need supabase; need psql; need pg_dump
+  IFS=',' read -ra SCHEMAS <<< "$APP_SCHEMAS"
+
+  log "supabase stack in $LOCAL_DB_DIR"
+  mkdir -p "$LOCAL_DB_DIR"
+  [ -f "$LOCAL_DB_DIR/supabase/config.toml" ] || ( cd "$LOCAL_DB_DIR" && yes n | supabase init >/dev/null 2>&1 || true )
+  ( cd "$LOCAL_DB_DIR" && supabase start ) || die "supabase start failed"
+
+  local existing; existing="$(lsql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo 0)"
+  if [ "${existing:-0}" -gt 0 ]; then
+    log "schema already loaded ($existing public tables); skipping load (use 'avoca-dev reset' to rebuild)"
+  else
+    local prod_url; prod_url="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+    [ -n "$prod_url" ] || die "no POSTGRES_URL in $PROD_ENV_FILE (run 'vercel env pull' there first)"
+    log "load prod schema (schema-only, READ-ONLY on prod)"
+    lsql -q -c "DROP SCHEMA IF EXISTS public CASCADE; $(for s in "${SCHEMAS[@]}"; do [ "$s" = public ] || echo "DROP SCHEMA IF EXISTS $s CASCADE;"; done) CREATE SCHEMA public;"
+    lsql -q -c "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gin SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public; CREATE EXTENSION IF NOT EXISTS moddatetime SCHEMA public; CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" SCHEMA public; CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public; CREATE EXTENSION IF NOT EXISTS citext SCHEMA public; CREATE EXTENSION IF NOT EXISTS unaccent SCHEMA public;"
+    local args=(); for s in "${SCHEMAS[@]}"; do args+=(--schema="$s"); done
+    local tmp; tmp="$(mktemp -t avoca-schema.XXXX.sql)"
+    pg_dump "$prod_url" --schema-only --no-owner --no-privileges "${args[@]}" \
+      | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
+    lsql -v ON_ERROR_STOP=0 -q -f "$tmp" 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -20 || true
+    rm -f "$tmp"
+    local loaded; loaded="$(lsql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")"
+    [ "${loaded:-0}" -gt 50 ] || die "schema load looks incomplete ($loaded public tables)"
+    log "loaded $loaded public tables"
+  fi
+
+  cmd_grants
+  cmd_ledger
+  log "setup done. Next: avoca-dev seed  →  avoca-dev up <worktree>"
+}
+
+# Supabase role grants (pg_dump --no-privileges strips these; without them the
+# app gets 'permission denied for schema public' via PostgREST).
+cmd_grants() {
+  log "grant anon/authenticated/service_role on the app schemas"
+  local schemas_sql="ARRAY['${APP_SCHEMAS//,/\',\'}']"
+  lsql -q <<SQL 2>/dev/null
+DO \$\$
+DECLARE s text;
+BEGIN
+  FOREACH s IN ARRAY $schemas_sql LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO anon, authenticated, service_role', s);
+    EXECUTE format('GRANT ALL ON ALL TABLES IN SCHEMA %I TO anon, authenticated, service_role', s);
+    EXECUTE format('GRANT ALL ON ALL SEQUENCES IN SCHEMA %I TO anon, authenticated, service_role', s);
+    EXECUTE format('GRANT ALL ON ALL ROUTINES IN SCHEMA %I TO anon, authenticated, service_role', s);
+    EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT ALL ON TABLES TO anon, authenticated, service_role', s);
+    EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT ALL ON SEQUENCES TO anon, authenticated, service_role', s);
+    EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT ALL ON ROUTINES TO anon, authenticated, service_role', s);
+  END LOOP;
+END \$\$;
+SQL
+}
+
+# Seed the umzug ledger from origin/main so 'db:up' only runs unmerged migrations.
+cmd_ledger() {
+  log "seed umzug ledger from origin/main"
+  lsql -q -c "CREATE SCHEMA IF NOT EXISTS migrations; CREATE TABLE IF NOT EXISTS migrations.umzug_migrations (name text PRIMARY KEY);"
+  ( cd "$AVOCA_NEXT_DIR" && git ls-tree -r --name-only origin/main -- packages/db/migrations/ 2>/dev/null ) \
+    | sed -nE 's#packages/db/migrations/([0-9]+_[^/]+\.sql)$#\1#p' \
+    | while IFS= read -r m; do [ -n "$m" ] && lsql -q -c "INSERT INTO migrations.umzug_migrations(name) VALUES ('$m') ON CONFLICT DO NOTHING;"; done || true
+}
+
+# ── seed: synthetic fixtures + a login user ───────────────────────────────
+cmd_seed() {
+  need psql
+  log "load synthetic fixtures (enterprise + teams + agents + transfer destinations)"
+  lsql -q -f "$SELF_DIR/seed/base.sql" 2>&1 | grep -iE 'error|^ *[a-z].*\| *[0-9]' | head -20 || true
+  log "seed login user $LOGIN_EMAIL / $LOGIN_PASSWORD (@avoca.ai => system admin)"
+  lsql -q -v email="$LOGIN_EMAIL" -v pass="$LOGIN_PASSWORD" -v fullname="$LOGIN_NAME" -f "$SELF_DIR/seed/login-user.sql" 2>&1 | grep -iE 'error|confirmed|bcrypt|identity|profile' | head -10 || true
+  log "seed done."
+}
+
+# ── db: point a worktree's env local <-> prod ─────────────────────────────
+BEGIN_MARK="# >>> avoca-dev managed: LOCAL db overrides (do not edit) >>>"
+END_MARK="# <<< avoca-dev managed <<<"
+strip_block() {
+  local f="$1"; [ -f "$f" ] || return 0
+  awk -v b="$BEGIN_MARK" '
+    index($0,b)==1 || index($0,"# --- shared local DB")==1 || index($0,"# >>> point-db managed")==1 { stop=1 }
+    stop { next } { print }
+  ' "$f" > "$f.adv1"
+  grep -vxF -e "POSTGRES_HOST=127.0.0.1" -e "POSTGRES_PORT=54322" -e "POSTGRES_DB=postgres" \
+    -e "POSTGRES_USER=postgres" -e "POSTGRES_PASSWORD=postgres" \
+    -e "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API" \
+    -e "POSTGRES_URL=$LOCAL_PG_URL" \
+    -e "WEB_APP_URL=http://localhost:3000" -e "NEXT_PUBLIC_WEB_APP_URL=http://localhost:3000" \
+    -e "NEXT_PUBLIC_DASHBOARD_URL=http://localhost:3002" \
+    "$f.adv1" > "$f.adv2" || true
+  awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last]==""){last--}; for(i=1;i<=last;i++) print a[i]}' "$f.adv2" > "$f"
+  rm -f "$f.adv1" "$f.adv2"
+}
+cmd_db() {
+  local action="${1:?usage: avoca-dev db <setdev|setprod|status> [worktree]}"; local wt; wt="$(resolve_worktree "${2:-}")"
+  local web="$wt/apps/web/.env.local" dash="$wt/apps/dashboard/.env.local"
+  local env; env="$(sb_env)"; LOCAL_API="$(sbval "$env" API_URL)"; LOCAL_API="${LOCAL_API:-http://127.0.0.1:54321}"
+
+  if [ "$action" = status ]; then
+    echo "avoca-dev db  ($(basename "$wt"))"
+    for pair in "apps/web:$web" "apps/dashboard:$dash"; do
+      local app="${pair%%:*}" f="${pair#*:}" url tag
+      [ -f "$f" ] || { echo "  $app: (no .env.local)"; continue; }
+      url="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+      case "$url" in *127.0.0.1*|*localhost*) tag="LOCAL";; *) tag="prod ";; esac
+      echo "  $app: $tag  (supabase=$url)"
+    done; return 0
+  fi
+
+  strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
+  if [ "$action" = setprod ] || [ "$action" = prod ]; then
+    log "$(basename "$wt") → PROD (stripped local overrides; reverts to Vercel-pulled values)"
+    echo "  restart any running dev server to apply."; return 0
+  fi
+  [ "$action" = setdev ] || [ "$action" = dev ] || [ "$action" = local ] || die "action must be setdev, setprod, or status"
+
+  local anon svc; anon="$(sbval "$env" ANON_KEY)"; svc="$(sbval "$env" SERVICE_ROLE_KEY)"
+  [ -n "$anon" ] && [ -n "$svc" ] || die "couldn't read local Supabase keys — is the stack up? (avoca-dev setup)"
+  { echo ""; echo "$BEGIN_MARK"
+    echo "POSTGRES_HOST=127.0.0.1"; echo "POSTGRES_PORT=54322"; echo "POSTGRES_DB=postgres"
+    echo "POSTGRES_USER=postgres"; echo "POSTGRES_PASSWORD=postgres"
+    echo "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API"; echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
+    echo "SUPABASE_SECRET_KEY=$svc"; echo "NEXT_PUBLIC_DASHBOARD_URL=http://localhost:3002"
+    echo "$END_MARK"; } >> "$web"
+  if [ -f "$dash" ]; then
+    { echo ""; echo "$BEGIN_MARK"
+      echo "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API"; echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
+      echo "SUPABASE_SECRET_KEY=$svc"; echo "POSTGRES_URL=$LOCAL_PG_URL"
+      echo "WEB_APP_URL=http://localhost:3000"; echo "NEXT_PUBLIC_WEB_APP_URL=http://localhost:3000"
+      echo "$END_MARK"; } >> "$dash"
+  fi
+  log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322)"
+  echo "  restart any running dev server to apply (or use 'avoca-dev up')."
+}
+
+# ── up: seamless local dev in one shot ────────────────────────────────────
+cmd_up() {
+  local wt; wt="$(resolve_worktree "${1:-}")"
+  cmd_db setdev "$wt" >/dev/null
+  local app nx
+  for app in web dashboard; do
+    nx="$wt/apps/$app/.next"
+    if [ -d "$nx" ] && grep -rqlF "$PROD_PROJECT_REF" "$nx/static" 2>/dev/null; then
+      log "dropping stale $app/.next (prod URL was baked into the bundle)"; rm -rf "$nx"
+    fi
+  done
+  log "$(basename "$wt")/apps/web → pnpm dev (local DB, fresh bundle)"
+  cd "$wt/apps/web"; exec pnpm dev
+}
+
+# ── oauth: wire Google sign-in on the local stack ─────────────────────────
+cmd_oauth() {
+  local cid="${1:?usage: avoca-dev oauth <google-client-id> <google-secret>}"; local secret="${2:?need the client secret}"
+  local cfg="$LOCAL_DB_DIR/supabase/config.toml"
+  [ -f "$cfg" ] || die "no config.toml at $cfg (run 'avoca-dev setup' first)"
+  if grep -q "^\[auth.external.google\]" "$cfg"; then
+    log "google stanza already present in config.toml — leaving it, updating env"
+  else
+    log "add [auth.external.google] to config.toml"
+    { echo ""; echo "[auth.external.google]"; echo "enabled = true"
+      echo 'client_id = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID)"'
+      echo 'secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"'; } >> "$cfg"
+  fi
+  # supabase reads these from the LOCAL_DB_DIR/.env at start
+  local envf="$LOCAL_DB_DIR/.env"; touch "$envf"
+  grep -q '^SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID=' "$envf" || echo "SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID=$cid" >> "$envf"
+  grep -q '^SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET='    "$envf" || echo "SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET=$secret" >> "$envf"
+  log "restart the stack to apply (preserves data): (cd $LOCAL_DB_DIR && supabase stop && supabase start)"
+  echo "  In Google Cloud Console, the OAuth client's Authorized redirect URI must be:"
+  echo "    http://127.0.0.1:54321/auth/v1/callback"
+  echo "  Then browse the app at http://127.0.0.1:3000 (matches site_url; cookies need one host)."
+}
+
+# ── trim: cut the Supabase stack to the services we actually use ──────────
+cmd_trim() {
+  local cfg="$LOCAL_DB_DIR/supabase/config.toml"
+  [ -f "$cfg" ] || die "no config.toml at $cfg"
+  log "disabling unused services (analytics, storage, realtime, edge_runtime) in config.toml"
+  # Set enabled=false under each service stanza. Conservative: keep studio + inbucket.
+  for svc in analytics storage realtime edge_runtime; do
+    if grep -q "^\[$svc\]" "$cfg"; then
+      awk -v s="$svc" '
+        $0=="["s"]"{inb=1; print; next}
+        inb && /^\[/{inb=0}
+        inb && /^enabled *=/{print "enabled = false"; done=1; next}
+        {print}
+      ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    fi
+  done
+  log "restart to apply (preserves data): (cd $LOCAL_DB_DIR && supabase stop && supabase start)"
+}
+
+# ── status: the whole picture ─────────────────────────────────────────────
+cmd_status() {
+  echo "avoca-dev status"
+  echo "  local db dir: $LOCAL_DB_DIR"
+  local n; n="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "supabase_.*$(basename "$LOCAL_DB_DIR")" || true)"
+  echo "  supabase containers: ${n:-0}"
+  local t; t="$(lsql -tAc "select count(*) from teams" 2>/dev/null || echo '?')"
+  echo "  local db teams: $t   (schema-only mirror + your seed)"
+  echo "  worktree pointers ($WORKTREES_DIR):"
+  [ -d "$WORKTREES_DIR" ] || { echo "    (none)"; return 0; }
+  local d found=0
+  for d in "$WORKTREES_DIR"/*/; do
+    [ -d "$d/apps/web" ] || continue
+    found=1
+    printf '    %-30s web=%-5s dash=%s\n' "$(basename "$d")" \
+      "$(ptr_tag "$d/apps/web/.env.local")" "$(ptr_tag "$d/apps/dashboard/.env.local")"
+  done
+  [ "$found" = 1 ] || echo "    (no avoca-next worktrees found)"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────
+case "${1:-}" in
+  setup)   shift; cmd_setup "$@";;
+  grants)  shift; cmd_grants "$@";;
+  ledger)  shift; cmd_ledger "$@";;
+  seed)    shift; cmd_seed "$@";;
+  db)      shift; cmd_db "$@";;
+  up)      shift; cmd_up "$@";;
+  oauth)   shift; cmd_oauth "$@";;
+  trim)    shift; cmd_trim "$@";;
+  status)  shift; cmd_status "$@";;
+  ""|-h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command '$1' (try: avoca-dev help)";;
+esac
