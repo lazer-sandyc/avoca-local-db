@@ -35,7 +35,15 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { echo "avoca-dev: $*" >&2; exit 1; }
 log() { echo "▸ $*"; }
-need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' on PATH"; }
+need() {
+  command -v "$1" >/dev/null 2>&1 && return
+  case "$1" in
+    supabase)     die "missing the 'supabase' CLI. Install it:  brew install supabase/tap/supabase   (docs: supabase.com/docs/guides/cli)";;
+    psql|pg_dump) die "missing '$1' (Postgres client). Install it:  brew install libpq && brew link --force libpq";;
+    docker)       die "missing 'docker'. Install a Docker engine: Docker Desktop, OrbStack, or colima.";;
+    *)            die "missing '$1' on PATH";;
+  esac
+}
 
 # Local Supabase status → env-style values (API_URL, ANON_KEY, SERVICE_ROLE_KEY, DB_URL)
 sb_env() { ( cd "$LOCAL_DB_DIR" && supabase status -o env 2>/dev/null || true ); }
@@ -126,6 +134,14 @@ cmd_ledger() {
   ( cd "$AVOCA_NEXT_DIR" && git ls-tree -r --name-only origin/main -- packages/db/migrations/ 2>/dev/null ) \
     | sed -nE 's#packages/db/migrations/([0-9]+_[^/]+\.sql)$#\1#p' \
     | while IFS= read -r m; do [ -n "$m" ] && lsql -q -c "INSERT INTO migrations.umzug_migrations(name) VALUES ('$m') ON CONFLICT DO NOTHING;"; done || true
+}
+
+# ── reset: wipe the local DB back to empty, then re-run setup ─────────────
+cmd_reset() {
+  need supabase
+  log "reset: supabase db reset (empties the DB; keeps the stack, auth, extensions)"
+  ( cd "$LOCAL_DB_DIR" && supabase db reset ) || die "supabase db reset failed"
+  cmd_setup
 }
 
 # ── seed: synthetic fixtures + a login user ───────────────────────────────
@@ -279,6 +295,7 @@ cmd_status() {
 # ── dispatch ──────────────────────────────────────────────────────────────
 case "${1:-}" in
   setup)   shift; cmd_setup "$@";;
+  reset)   shift; cmd_reset "$@";;
   grants)  shift; cmd_grants "$@";;
   ledger)  shift; cmd_ledger "$@";;
   seed)    shift; cmd_seed "$@";;

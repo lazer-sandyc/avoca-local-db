@@ -17,9 +17,15 @@ seamless local dev loop. Prod is only ever **read** (a schema dump); it is never
 
 ## Prerequisites
 
-- Docker (OrbStack or Docker Desktop), the Supabase CLI, `psql` + `pg_dump` (Postgres 15+ client).
+- **A Docker engine** — Docker Desktop, OrbStack, colima, Rancher Desktop, any of them. This is
+  required by the Supabase CLI: `supabase start` runs the stack (Postgres + GoTrue auth +
+  PostgREST + Kong gateway + …) as containers; there is no non-Docker mode. We use the Supabase
+  stack rather than a bare Postgres because the app needs auth (GoTrue) and every
+  `supabase.from()` query (PostgREST), and the prod schema dump assumes the Supabase base
+  (the `auth` schema + the `anon`/`authenticated`/`service_role` roles).
+- The Supabase CLI, plus `psql` + `pg_dump` (Postgres 15+ client).
 - An avoca-next clone with a working dev env (`vercel env pull` done in `apps/web`), so the
-  tool can read the prod DB url for the **schema** dump.
+  tool can read the prod DB url for the **schema** dump (read-only).
 
 ## Setup
 
