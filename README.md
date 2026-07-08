@@ -54,19 +54,19 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | Command | What it does |
 |---|---|
 | `avoca-dev setup` | Stand up local Supabase, load prod's schema (schema-only), grant the Supabase roles, seed the migration ledger. |
-| `avoca-dev seed` | Load synthetic fixtures (`seed/*.sql`) + a login user. |
+| `avoca-dev seed` | Load synthetic fixtures (`seed/*.sql`) + a login user, and (idempotent, best-effort) provision a Twilio subaccount per seeded team. |
 | `avoca-dev db setdev [wt]` | Point a worktree's env (apps/web + apps/dashboard) at the **local** DB. |
 | `avoca-dev db setprod [wt]` | Revert it to **prod** (strips the local overrides). |
 | `avoca-dev db status [wt]` | Show which DB each app is on. |
 | `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next` + `pnpm dev`, in one shot. |
 | `avoca-dev oauth <id> <secret>` | Wire Google sign-in on the local stack (needs a stack restart). |
 | `avoca-dev trim` | Cut the Supabase stack to the ~7 containers the app uses. |
-| `avoca-dev twilio provision <team>` | Give a test team a real Twilio subaccount (tagged `avoca-dev-local`) so the admin buy-number flow works. |
-| `avoca-dev twilio deprovision <team>` | Release its numbers, close the subaccount, clean local rows. Refuses any subaccount not tagged by us. |
+| `avoca-dev twilio provision [team]` | Provision a subaccount for one team, or (no arg) every seeded team lacking one. Idempotent. |
+| `avoca-dev twilio deprovision [team]` | Reclaim one team, or (no arg) **all** local subaccounts — release numbers, close the subaccount, clean rows. Tag-gated: only ever closes subaccounts tagged `avoca-dev-local`, so it can never touch a real customer's. |
 | `avoca-dev twilio status` | Audit the subaccounts we provisioned. |
 | `avoca-dev status` | Show the stack, the DB, and which worktrees point where. |
 
-**Telephony note:** `twilio provision` makes real actions on Avoca's ISV Twilio account (a subaccount; any numbers you then buy are real, ~$1/mo). Every subaccount is tagged `avoca-dev-local …`, so `deprovision` can safely reclaim only ours — run it when you close a plan/worktree so nothing lingers.
+**Telephony lifecycle.** `seed` idempotently provisions a real Twilio subaccount per seeded team (best-effort — skipped if ISV creds aren't present), so number-buying works out of the box. These are real actions on Avoca's ISV Twilio account (subaccounts; any numbers you buy are real, ~$1/mo). Every subaccount is tagged `avoca-dev-local …` in its FriendlyName, and `deprovision` is **tag-gated** — it can only ever close subaccounts carrying that tag, never a real customer's. **When you close a plan/worktree, run `avoca-dev twilio deprovision`** (no arg) to reclaim everything, so nothing lingers on Avoca's account. If you create extra test teams via the UI, name them with `avoca-dev-local` so their subaccounts are reclaimable too.
 
 ## Google sign-in (optional, nicer than password)
 
