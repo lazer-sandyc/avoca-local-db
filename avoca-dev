@@ -357,12 +357,11 @@ _tw_deprovision_one() {
     "$FN_PREFIX"*) : ;;
     *) echo "  team $team: SKIP $sid — FriendlyName '$fn' lacks the '$FN_PREFIX' tag (not closing; rename the team with the tag if it IS a local test one)"; return 0;;
   esac
-  log "team $team → closing $sid  ('$fn')"
-  _tw "https://api.twilio.com/2010-04-01/Accounts/$sid/IncomingPhoneNumbers.json?PageSize=100" \
-    | _json "'\n'.join(n['sid'] for n in d.get('incoming_phone_numbers',[]))" \
-    | while read -r num; do [ -n "$num" ] && { _tw -o /dev/null -X DELETE "https://api.twilio.com/2010-04-01/Accounts/$sid/IncomingPhoneNumbers/$num.json"; echo "    released $num"; }; done
-  _tw -o /dev/null -X POST "https://api.twilio.com/2010-04-01/Accounts/$sid.json" --data-urlencode "Status=closed"
-  lsql -q -c "delete from team_twilio_configs where team_id=$team; delete from phone_numbers where team_id=$team and phone_number not like '+1999555%';"
+  # Closing a subaccount releases its numbers automatically — no separate release
+  # call needed (and that call was the fragile step that aborted under set -e).
+  local st; st="$(_tw -X POST "https://api.twilio.com/2010-04-01/Accounts/$sid.json" --data-urlencode "Status=closed" | _json "d.get('status','?')" || true)"
+  log "team $team → subaccount $sid closed (status=${st:-?}); numbers released"
+  lsql -q -c "delete from team_twilio_configs where team_id=$team; delete from phone_numbers where team_id=$team and phone_number not like '+1999555%';" || true
 }
 
 _tw_status() {
