@@ -61,7 +61,12 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next` + `pnpm dev`, in one shot. |
 | `avoca-dev oauth <id> <secret>` | Wire Google sign-in on the local stack (needs a stack restart). |
 | `avoca-dev trim` | Cut the Supabase stack to the ~7 containers the app uses. |
+| `avoca-dev twilio provision <team>` | Give a test team a real Twilio subaccount (tagged `avoca-dev-local`) so the admin buy-number flow works. |
+| `avoca-dev twilio deprovision <team>` | Release its numbers, close the subaccount, clean local rows. Refuses any subaccount not tagged by us. |
+| `avoca-dev twilio status` | Audit the subaccounts we provisioned. |
 | `avoca-dev status` | Show the stack, the DB, and which worktrees point where. |
+
+**Telephony note:** `twilio provision` makes real actions on Avoca's ISV Twilio account (a subaccount; any numbers you then buy are real, ~$1/mo). Every subaccount is tagged `avoca-dev-local …`, so `deprovision` can safely reclaim only ours — run it when you close a plan/worktree so nothing lingers.
 
 ## Google sign-in (optional, nicer than password)
 

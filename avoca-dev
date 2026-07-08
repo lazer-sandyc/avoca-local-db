@@ -13,6 +13,9 @@
 #   avoca-dev up         [worktree] # seamless: point local + drop stale bundle + pnpm dev
 #   avoca-dev oauth <client-id> <secret>   # wire Google sign-in locally (needs a stack restart)
 #   avoca-dev trim                  # cut the Supabase stack to the ~7 containers we use
+#   avoca-dev twilio provision   <team>   # give a test team a Twilio subaccount (so number-buying works)
+#   avoca-dev twilio deprovision <team>   # release its numbers + close the subaccount + clean up
+#   avoca-dev twilio status               # audit the subaccounts we provisioned
 #   avoca-dev status                # show the stack + db + worktree pointers
 #
 # Config: copy config.example.sh -> config.sh and edit, or override any var via env.
@@ -272,6 +275,80 @@ cmd_trim() {
   log "restart to apply (preserves data): (cd $LOCAL_DB_DIR && supabase stop && supabase start)"
 }
 
+# ── twilio: provision / deprovision / audit test subaccounts ─────────────
+# Real actions on Avoca's ISV Twilio master account, but SAFE: every subaccount
+# we create is tagged FN_PREFIX in its FriendlyName, and deprovision refuses to
+# touch any subaccount whose FriendlyName lacks that marker — so automated
+# teardown can never close a real customer's subaccount.
+FN_PREFIX="avoca-dev-local"
+_twilio_creds() {
+  need python3
+  local f="$PROD_ENV_FILE"
+  ISV_SID="$(grep -E '^TWILIO_ISV_ACCOUNT_SID=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  ISV_TOK="$(grep -E '^TWILIO_ISV_AUTH_TOKEN=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  [ -n "$ISV_SID" ] && [ -n "$ISV_TOK" ] || die "no TWILIO_ISV_ACCOUNT_SID/AUTH_TOKEN in $f (run 'vercel env pull' there)"
+}
+_tw() { curl -s -u "$ISV_SID:$ISV_TOK" "$@"; }               # authed as ISV master
+_json() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)" 2>/dev/null; }
+
+cmd_twilio() {
+  local action="${1:?usage: avoca-dev twilio <provision|deprovision|status> [team]}"; shift || true
+  _twilio_creds
+  case "$action" in
+    provision)   _tw_provision "$@";;
+    deprovision) _tw_deprovision "$@";;
+    status)      _tw_status "$@";;
+    *) die "twilio action must be provision, deprovision, or status";;
+  esac
+}
+
+_tw_provision() {
+  local team="${1:?usage: avoca-dev twilio provision <team>}"
+  local have; have="$(lsql -tAc "select subaccount_sid from team_twilio_configs where team_id=$team limit 1" 2>/dev/null)"
+  [ -z "$have" ] || { echo "team $team already has subaccount $have — nothing to do"; return 0; }
+  local fn="$FN_PREFIX team $team"
+  log "creating Twilio subaccount '$fn' under the ISV master…"
+  local resp; resp="$(_tw -X POST "https://api.twilio.com/2010-04-01/Accounts.json" --data-urlencode "FriendlyName=$fn")"
+  local sid tok; sid="$(printf '%s' "$resp" | _json "d.get('sid','')")"; tok="$(printf '%s' "$resp" | _json "d.get('auth_token','')")"
+  [ -n "$sid" ] || die "subaccount create failed: $(printf '%s' "$resp" | head -c 300)"
+  lsql -q -c "insert into team_twilio_configs (team_id, subaccount_sid, subaccount_auth_token) values ($team, '$sid', '$tok');" \
+    || die "subaccount $sid created on Twilio but the DB insert failed — close $sid manually"
+  log "team $team → subaccount $sid  (FriendlyName '$fn')"
+  echo "  the admin search/buy-number flow now works for this team."
+  echo "  reclaim later:  avoca-dev twilio deprovision $team"
+}
+
+_tw_deprovision() {
+  local team="${1:?usage: avoca-dev twilio deprovision <team>}"
+  local sid; sid="$(lsql -tAc "select subaccount_sid from team_twilio_configs where team_id=$team limit 1" 2>/dev/null)"
+  [ -n "$sid" ] || { echo "team $team has no subaccount config — nothing to deprovision"; return 0; }
+  # SAFETY: only ever touch a subaccount we tagged.
+  local fn; fn="$(_tw "https://api.twilio.com/2010-04-01/Accounts/$sid.json" | _json "d.get('friendly_name','')")"
+  case "$fn" in
+    "$FN_PREFIX"*) : ;;
+    *) die "REFUSING: subaccount $sid FriendlyName '$fn' is not '$FN_PREFIX…' — not ours, will not touch it";;
+  esac
+  log "releasing numbers under $sid…"
+  _tw "https://api.twilio.com/2010-04-01/Accounts/$sid/IncomingPhoneNumbers.json?PageSize=100" \
+    | _json "'\n'.join(n['sid'] for n in d.get('incoming_phone_numbers',[]))" \
+    | while read -r num; do [ -n "$num" ] && { _tw -o /dev/null -X DELETE "https://api.twilio.com/2010-04-01/Accounts/$sid/IncomingPhoneNumbers/$num.json"; echo "  released $num"; }; done
+  log "closing subaccount $sid…"
+  _tw -o /dev/null -X POST "https://api.twilio.com/2010-04-01/Accounts/$sid.json" --data-urlencode "Status=closed"
+  lsql -q -c "delete from team_twilio_configs where team_id=$team; delete from phone_numbers where team_id=$team and phone_number not like '+1999555%';"
+  log "deprovisioned team $team — subaccount closed, numbers released, config cleaned."
+}
+
+_tw_status() {
+  echo "avoca-dev twilio — subaccounts we provisioned (from team_twilio_configs):"
+  local any=0 team sid
+  while IFS='|' read -r team sid; do
+    [ -n "$sid" ] || continue; any=1
+    printf '    team %-8s %s  %s\n' "$team" "$sid" \
+      "$(_tw "https://api.twilio.com/2010-04-01/Accounts/$sid.json" | _json "d.get('friendly_name','?')+' ['+d.get('status','?')+']'")"
+  done < <(lsql -tAc "select team_id||'|'||subaccount_sid from team_twilio_configs order by team_id" 2>/dev/null)
+  [ "$any" = 1 ] || echo "    (none)"
+}
+
 # ── status: the whole picture ─────────────────────────────────────────────
 cmd_status() {
   echo "avoca-dev status"
@@ -303,6 +380,7 @@ case "${1:-}" in
   up)      shift; cmd_up "$@";;
   oauth)   shift; cmd_oauth "$@";;
   trim)    shift; cmd_trim "$@";;
+  twilio)  shift; cmd_twilio "$@";;
   status)  shift; cmd_status "$@";;
   ""|-h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$1' (try: avoca-dev help)";;
