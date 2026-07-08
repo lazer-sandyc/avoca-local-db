@@ -32,6 +32,7 @@ DECLARE
   t          int;
   v_team_id  bigint;
   en_va uuid; es_va uuid; en_ac uuid; es_ac uuid;
+  en_td bigint; es_td bigint;
   en_phone bigint; es_phone bigint;
   en_num text; es_num text;
   plat text;
@@ -100,11 +101,17 @@ BEGIN
        SET main_inbound_call_phone_id = es_phone, default_assistant_config_id = es_ac
      WHERE id = es_va;
 
-    -- agent-to-agent transfer destinations (target_assistant_config_id set =>
-    -- these are the intra-team agent handoffs the linking feature stitches)
-    INSERT INTO transfer_destinations (team_id, name, number, target_assistant_config_id, type, active)
-      VALUES (v_team_id, 'To Spanish agent', es_num, es_ac, 'number', true),
-             (v_team_id, 'To English agent', en_num, en_ac, 'number', true);
+    -- agent-to-agent transfer destinations, linked to the target agent via the
+    -- transfer_destination_assistants join table (prod dropped the old
+    -- transfer_destinations.target_assistant_config_id column). These are the
+    -- intra-team agent handoffs the linking feature stitches.
+    INSERT INTO transfer_destinations (team_id, name, number, type, active)
+      VALUES (v_team_id, 'To Spanish agent', es_num, 'number', true) RETURNING id INTO es_td;
+    INSERT INTO transfer_destinations (team_id, name, number, type, active)
+      VALUES (v_team_id, 'To English agent', en_num, 'number', true) RETURNING id INTO en_td;
+    INSERT INTO transfer_destination_assistants (transfer_destination_id, team_id, voice_assistant_id)
+      VALUES (es_td, v_team_id, es_va),
+             (en_td, v_team_id, en_va);
   END LOOP;
 END $$;
 
@@ -118,4 +125,5 @@ UNION ALL SELECT 'teams',                 count(*) FROM teams                 WH
 UNION ALL SELECT 'voice_assistants',      count(*) FROM voice_assistants      WHERE team_id BETWEEN 990001 AND 990099
 UNION ALL SELECT 'assistant_configs',     count(*) FROM assistant_configs     WHERE team_id BETWEEN 990001 AND 990099
 UNION ALL SELECT 'phone_numbers',         count(*) FROM phone_numbers         WHERE team_id BETWEEN 990001 AND 990099
-UNION ALL SELECT 'transfer_destinations (agent-typed)', count(*) FROM transfer_destinations WHERE team_id BETWEEN 990001 AND 990099 AND target_assistant_config_id IS NOT NULL;
+UNION ALL SELECT 'transfer_destinations',            count(*) FROM transfer_destinations            WHERE team_id BETWEEN 990001 AND 990099
+UNION ALL SELECT 'transfer_destination_assistants',  count(*) FROM transfer_destination_assistants  WHERE team_id BETWEEN 990001 AND 990099;
