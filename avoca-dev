@@ -5,8 +5,12 @@
 # points a worktree's env at it, and gives you a one-command seamless dev loop.
 # Everything is reversible; prod is only ever read (schema dump), never written.
 #
-#   avoca-dev setup                 # one-time: stand up the local DB (schema-only mirror)
+#   avoca-dev setup                 # one-time: stand up the local DB (schema-only mirror + reference data)
+#   avoca-dev reference             # (re)load global lookup data from prod (voices, llm_models, transcribers, …)
 #   avoca-dev seed                  # load synthetic test fixtures + a login user
+#   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from prod
+#   avoca-dev duplicate-team <id>   # copy a prod team's CONFIG from prod (no calls/PII; provider handles scrubbed)
+#   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
 #   avoca-dev db setprod [worktree] # revert it to the PROD db
 #   avoca-dev db status  [worktree] # show which db each app is on
@@ -30,11 +34,16 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${WORKTREES_DIR:=$HOME/code/lazer/avoca/avoca-next.worktrees}"        # where worktrees live
 : "${LOCAL_DB_DIR:=$HOME/code/lazer/avoca/avoca-local-db}"              # supabase-local home
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"                      # schemas to mirror
+: "${REFERENCE_TABLES:=voices,llm_models,transcribers}"                  # global lookup data the app needs (no PII); copied data-only from prod
 : "${PROD_PROJECT_REF:=wmizcewjcybhvkpwpmim}"                            # prod supabase ref
 : "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # source of PROD db url (read-only)
 : "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
 : "${LOGIN_PASSWORD:=avoca-local-dev}"
 : "${LOGIN_NAME:=Local Dev}"
+# Synthetic owner + enterprise a duplicated prod team is re-attached to, so we
+# never copy real owner PII (auth.users/profiles). Must match seed/base.sql.
+: "${SEED_OWNER_ID:=b0000000-0000-0000-0000-000000000001}"
+: "${SEED_ENTERPRISE_ID:=990000}"
 
 die() { echo "avoca-dev: $*" >&2; exit 1; }
 log() { echo "▸ $*"; }
@@ -105,7 +114,219 @@ cmd_setup() {
 
   cmd_grants
   cmd_ledger
+  cmd_reference
   log "setup done. Next: avoca-dev seed  →  avoca-dev up <worktree>"
+}
+
+# Reference / lookup data the app genuinely needs to function (voice list, LLM
+# models, transcribers, …) — global tables, no team scope, no PII. Copied
+# data-only from prod (READ-ONLY) and idempotent: --inserts --on-conflict-do-nothing
+# so re-running never duplicates. Edit REFERENCE_TABLES (config.sh) to add more.
+# The PROD Postgres url (read-only source for schema, reference data, dup copies).
+_prod_url() {
+  local u; u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  [ -n "$u" ] || die "no POSTGRES_URL in $PROD_ENV_FILE (run 'vercel env pull' there first)"
+  printf '%s\n' "$u"
+}
+
+cmd_reference() {
+  need psql; need pg_dump
+  local prod_url; prod_url="$(_prod_url)"
+  IFS=',' read -ra RTABLES <<< "$REFERENCE_TABLES"
+  log "load reference data from prod (READ-ONLY): $REFERENCE_TABLES"
+  for t in "${RTABLES[@]}"; do
+    [ -n "$t" ] || continue
+    pg_dump "$prod_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
+      | lsql -q -v ON_ERROR_STOP=0 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -5 || true
+    local n; n="$(lsql -tAc "select count(*) from $t" 2>/dev/null || echo '?')"
+    log "  $t: $n rows"
+  done
+}
+
+# ── duplicate: copy a real prod record graph (config only) into local ─────
+# Prod is READ-ONLY. Loads run on the LOCAL side with FK triggers disabled
+# (session_replication_role=replica) so insert order never matters and circular
+# refs are fine; and via COPY so identity/serial ids are preserved EXACTLY —
+# that's what keeps foreign keys valid across the copy.
+
+# Non-generated column list for a table (keeps identity/serial, drops STORED
+# generated columns which COPY cannot accept).
+_cols() {
+  lsql -tAc "select string_agg(quote_ident(column_name), ', ' order by ordinal_position)
+             from information_schema.columns
+             where table_schema='public' and table_name='$1' and is_generated='NEVER'"
+}
+
+# Copy rows prod -> local for one table.  _pull <prod_url> <table> <where-sql>
+# Runs under replica role; caller is responsible for clearing stale rows first.
+_pull() {
+  local url="$1" tbl="$2" where="$3"
+  local cols; cols="$(_cols "$tbl")"
+  [ -n "$cols" ] || die "unknown table: $tbl"
+  local tmp; tmp="$(mktemp -t avoca-pull.XXXX)"
+  psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
+    || { cat "$tmp.err" >&2; rm -f "$tmp" "$tmp.err"; die "prod read failed for $tbl"; }
+  local n; n="$(wc -l < "$tmp" | tr -d ' ')"
+  lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+\copy public.$tbl ($cols) from '$tmp'
+SQL
+  rm -f "$tmp" "$tmp.err"
+  log "  $tbl: +$n rows"
+}
+
+# duplicate-bp <blueprint_id>: copy a modular blueprint (+ its versions and
+# assistant variables) from prod so the builder / clone-from-template works.
+cmd_duplicate_bp() {
+  local id="${1:?usage: avoca-dev duplicate-bp <blueprint_id>}"
+  need psql
+  local url; url="$(_prod_url)"
+  local name; name="$(psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
+  [ -n "$name" ] || die "no blueprint '$id' in prod"
+  log "duplicate blueprint '$id' from prod (READ-ONLY)"
+  # idempotent: drop any prior copy first (FK triggers off, so order is free)
+  lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+delete from public.assistant_variables_versions   where blueprint_id='$id';
+delete from public.assistant_variables            where blueprint_id='$id';
+delete from public.multi_agent_blueprint_versions where blueprint_id='$id';
+delete from public.multi_agent_blueprints          where id='$id';
+SQL
+  _pull "$url" multi_agent_blueprints         "id='$id'"
+  _pull "$url" multi_agent_blueprint_versions "blueprint_id='$id'"
+  _pull "$url" assistant_variables            "blueprint_id='$id'"
+  _pull "$url" assistant_variables_versions   "blueprint_id='$id'"
+  log "done — blueprint is now in local."
+}
+
+# Remove every locally-copied row for a team (the config allowlist). FK triggers
+# off => order-free. Does NOT touch Twilio or team_twilio_configs.
+_purge_team_local() {
+  local team="$1"
+  lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+delete from public.assistant_variables_versions   where team_id=$team;
+delete from public.assistant_variables             where team_id=$team;
+delete from public.transfer_destination_assistants where team_id=$team;
+delete from public.transfer_destinations           where team_id=$team;
+delete from public.assistant_config_versions       where config_id in (select id from public.assistant_configs where team_id=$team);
+delete from public.assistant_configs               where team_id=$team;
+delete from public.voice_assistants                where team_id=$team;
+delete from public.phone_numbers                   where team_id=$team;
+delete from public.teams                           where id=$team;
+SQL
+}
+
+# delete-team <team_id>: the inverse of duplicate-team — get rid of a test team
+# you're done with. The local DB is shared across ALL worktrees, so teardown is
+# per-team, not per-worktree. Releases the team's local Twilio subaccount first
+# (tag-gated — only ever closes an 'avoca-dev-local' subaccount), then purges its
+# config rows. Referenced blueprints are left (they're global / may be shared).
+cmd_delete_team() {
+  local team="${1:?usage: avoca-dev delete-team <team_id>}"
+  need psql
+  local name; name="$(lsql -tAc "select name from teams where id=$team" 2>/dev/null)"
+  [ -n "$name" ] || die "no team $team in local db"
+  local sub; sub="$(lsql -tAc "select subaccount_sid from team_twilio_configs where team_id=$team limit 1" 2>/dev/null)"
+  if [ -n "$sub" ]; then
+    if command -v python3 >/dev/null 2>&1 && _twilio_creds_soft; then
+      log "release local Twilio subaccount for team $team ($sub)"
+      ( _tw_deprovision_one "$team" ) || log "  twilio deprovision incomplete — run 'avoca-dev twilio deprovision $team'"
+    else
+      die "team $team has a live Twilio subaccount ($sub) but no ISV creds here to close it. Run 'avoca-dev twilio deprovision $team' with creds first, or you'll orphan it on Avoca's account."
+    fi
+  fi
+  log "delete team $team ('$name') + its config from local"
+  _purge_team_local "$team"
+  log "done — team $team removed."
+}
+
+# duplicate-team <team_id>: copy a real prod team's CONFIG (agents, voice
+# assistants, phone routing, transfer destinations, variables) into local —
+# NOT its runtime data (calls/CRM/analytics/logs). Every external-provider
+# handle is scrubbed on the way in (see below) so no local action can ever
+# mutate the real Twilio/Vapi/ElevenLabs asset, and the team is re-attached to
+# the synthetic seed owner/enterprise so no owner PII is copied. Referenced
+# modular blueprints are auto-pulled. Idempotent (drops any prior copy first).
+cmd_duplicate_team() {
+  local team="${1:?usage: avoca-dev duplicate-team <team_id>}"
+  need psql
+  local url; url="$(_prod_url)"
+  local name; name="$(psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  [ -n "$name" ] || die "no team $team in prod"
+  local ok; ok="$(lsql -tAc "select (exists(select 1 from profiles where id='$SEED_OWNER_ID') and exists(select 1 from enterprises where id=$SEED_ENTERPRISE_ID))::text" 2>/dev/null)"
+  [ "$ok" = true ] || die "run 'avoca-dev seed' first — need the synthetic owner + enterprise to attach the copied team to"
+  log "duplicate team $team ('$name') from prod (READ-ONLY; config only; provider handles scrubbed)"
+
+  _purge_team_local "$team"   # drop any prior copy so re-runs are idempotent
+
+  _pull "$url" teams                           "id=$team"
+  _pull "$url" phone_numbers                   "team_id=$team"
+  _pull "$url" voice_assistants                "team_id=$team"
+  _pull "$url" assistant_configs               "team_id=$team"
+  _pull "$url" assistant_config_versions       "config_id in (select id from public.assistant_configs where team_id=$team)"
+  _pull "$url" transfer_destinations           "team_id=$team"
+  _pull "$url" transfer_destination_assistants "team_id=$team"
+  _pull "$url" assistant_variables             "team_id=$team"
+  _pull "$url" assistant_variables_versions    "team_id=$team"
+
+  # Re-attach to the synthetic owner/enterprise (no PII), scrub the agent-level
+  # provider handle, and DELETE the copied phone numbers outright. We keep none
+  # of prod's numbers: they'd be inert config at best, and a rediscovery risk at
+  # worst — once ISV creds are present locally (required to test telephony), the
+  # app can identify a number in Twilio by its E.164 and repoint the REAL one.
+  # Dropping them forces you to provision a fresh LOCAL number (which you must do
+  # to test anyway) and leaves zero real digits in any table. FK triggers are off
+  # (replica role), so we clear the referencing columns by hand — locally the
+  # blocking children (calls, team_test_plans, workflow_campaigns, …) are never
+  # copied, so only voice_assistants / transfer_destinations point at a number.
+  lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+update public.teams set owner_id='$SEED_OWNER_ID', enterprise_id=$SEED_ENTERPRISE_ID where id=$team;
+update public.voice_assistants
+   set main_inbound_call_phone_id=null, backup_inbound_call_phone_id=null, test_inbound_call_phone_id=null
+ where team_id=$team;
+update public.transfer_destinations td set number=null
+  from public.phone_numbers p
+ where p.team_id=$team and td.team_id=$team and td.number = p.phone_number;
+delete from public.phone_numbers where team_id=$team;
+update public.assistant_configs set vapi_assistant_id=null where team_id=$team;
+SQL
+
+  # auto-pull any modular blueprints this team's agents reference
+  local bps; bps="$(psql "$url" -tAqc "
+    select distinct v.blueprint_id from public.multi_agent_blueprint_versions v
+    where v.id in (
+      select blueprint_version_id from public.assistant_configs
+        where team_id=$team and blueprint_version_id is not null
+      union
+      select blueprint_version_id from public.assistant_config_versions
+        where config_id in (select id from public.assistant_configs where team_id=$team)
+          and blueprint_version_id is not null
+    )" 2>/dev/null)"
+  for bp in $bps; do
+    [ -n "$bp" ] || continue
+    if [ -n "$(lsql -tAc "select 1 from multi_agent_blueprints where id='$bp'" 2>/dev/null)" ]; then
+      log "  blueprint $bp already local — skip"
+    else
+      log "  ↳ auto-pulling referenced blueprint $bp"
+      cmd_duplicate_bp "$bp"
+    fi
+  done
+
+  # Give the team a local Twilio SUBACCOUNT so it's immediately testable — best
+  # effort: only if ISV creds + python3 are present, never blocks the copy. This
+  # creates the subaccount only; you still buy a test NUMBER manually in the UI
+  # ("Provision Test Number"). Reclaim it (and the team) with 'delete-team'.
+  if command -v python3 >/dev/null 2>&1 && _twilio_creds_soft; then
+    log "provisioning local Twilio subaccount for team $team (idempotent)…"
+    ( _tw_provision_one "$team" ) || log "  twilio provisioning incomplete (non-fatal) — retry: avoca-dev twilio provision $team"
+  else
+    log "skipping Twilio subaccount (no ISV creds / python3) — run 'avoca-dev twilio provision $team' when you need to test calls"
+  fi
+
+  log "done — team $team ('$name') is in local (config only; numbers dropped; provider handles scrubbed; owner→synthetic)."
+  log "  telephony: buy a test number in the UI (Provision Test Number) on the local subaccount to test calls."
 }
 
 # Supabase role grants (pg_dump --no-privileges strips these; without them the
@@ -154,16 +375,9 @@ cmd_seed() {
   lsql -q -f "$SELF_DIR/seed/base.sql" 2>&1 | grep -iE 'error|^ *[a-z].*\| *[0-9]' | head -20 || true
   log "seed login user $LOGIN_EMAIL / $LOGIN_PASSWORD (@avoca.ai => system admin)"
   lsql -q -v email="$LOGIN_EMAIL" -v pass="$LOGIN_PASSWORD" -v fullname="$LOGIN_NAME" -f "$SELF_DIR/seed/login-user.sql" 2>&1 | grep -iE 'error|confirmed|bcrypt|identity|profile' | head -10 || true
-  # Provision Twilio subaccounts for the seeded teams — idempotent + best-effort.
-  # Only if ISV creds + python3 are present; a failure never blocks the seed.
-  # Reclaim them on teardown with 'avoca-dev twilio deprovision'.
-  if command -v python3 >/dev/null 2>&1 && _twilio_creds_soft; then
-    log "provisioning Twilio subaccounts for seeded teams (idempotent)…"
-    ( _tw_provision ) || log "  twilio provisioning incomplete (non-fatal) — retry: avoca-dev twilio provision"
-  else
-    log "skipping Twilio provisioning (no ISV creds / python3) — run 'avoca-dev twilio provision' when you need to buy numbers"
-  fi
-  log "seed done."
+  # Twilio subaccounts are NOT provisioned here — do it on demand from the app UI,
+  # or with 'avoca-dev twilio provision' when you actually need to buy numbers.
+  log "seed done. (Twilio: provision on demand from the UI or 'avoca-dev twilio provision'.)"
 }
 
 # ── db: point a worktree's env local <-> prod ─────────────────────────────
@@ -398,6 +612,10 @@ cmd_status() {
 # ── dispatch ──────────────────────────────────────────────────────────────
 case "${1:-}" in
   setup)   shift; cmd_setup "$@";;
+  reference) shift; cmd_reference "$@";;
+  duplicate-bp)   shift; cmd_duplicate_bp "$@";;
+  duplicate-team) shift; cmd_duplicate_team "$@";;
+  delete-team)    shift; cmd_delete_team "$@";;
   reset)   shift; cmd_reset "$@";;
   grants)  shift; cmd_grants "$@";;
   ledger)  shift; cmd_ledger "$@";;

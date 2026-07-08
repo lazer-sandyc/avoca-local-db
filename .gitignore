@@ -1,6 +1,9 @@
 # per-machine config (paths, creds) — copy from config.example.sh
 config.sh
 
+# local Supabase stack home (created by `avoca-dev setup`, per-machine)
+supabase/
+
 # nothing else here should be committed
 *.log
 .DS_Store

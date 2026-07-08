@@ -16,6 +16,12 @@ LOCAL_DB_DIR="$HOME/code/lazer/avoca/avoca-local-db"
 # Schemas mirrored from prod (comma-separated).
 APP_SCHEMAS="public,crm_service_titan,twilio"
 
+# Global lookup/reference tables the app needs to function (voice list, LLM
+# models, transcribers, …). Copied data-only from prod (READ-ONLY, no PII —
+# they're not team-scoped) by `setup` / `avoca-dev reference`. Add any other
+# global reference table your flow needs here.
+REFERENCE_TABLES="voices,llm_models,transcribers"
+
 # Prod Supabase project ref — used to detect a prod URL baked into a stale
 # .next bundle (the compile-time NEXT_PUBLIC split-brain).
 PROD_PROJECT_REF="wmizcewjcybhvkpwpmim"
