@@ -79,9 +79,33 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 
 **Telephony lifecycle.** Twilio is **not** touched by `seed`. You provision a subaccount and buy numbers **from the app UI**, when you actually need them — these are real actions on Avoca's ISV Twilio account (subaccounts; any numbers you buy are real, ~$1/mo). The CLI's role is only **teardown + audit**: `avoca-dev twilio deprovision` reclaims subaccounts and `avoca-dev twilio status` audits them. `deprovision` is **tag-gated** — it can only ever close subaccounts whose FriendlyName carries the `avoca-dev-local` tag, never a real customer's. **When you close a plan/worktree, run `avoca-dev twilio deprovision`** (no arg) to reclaim everything, so nothing lingers on Avoca's account. So the UI-provisioned subaccounts are reclaimable, name any test teams you create with `avoca-dev-local`. (There's still an `avoca-dev twilio provision` fallback if you ever need to seed a subaccount without the UI.)
 
-## Migrations: cheap local loop → PR
+## Migrations: pull prod → local, push local → PR
 
-The point of the local DB is that a migration is **cheap to iterate while it's unmerged** and only becomes immutable once it deploys. The loop:
+Local is a **point-in-time** mirror: `setup` dumps prod's schema once and seeds the umzug ledger from `origin/main`. Two flows keep it useful — one to stay current with prod, one to ship your own changes.
+
+### Pull: keep local current with prod
+
+As prod merges PRs, new migrations land on `main` and local drifts behind. The ledger was seeded from `origin/main` **at setup**, so anything merged *after* is "pending" locally — `migrate up` runs exactly those.
+
+```sh
+# incremental — preserves your fixtures + duplicated teams
+cd <worktree> && git fetch origin main && git merge origin/main   # bring in the new migration files
+avoca-dev migrate up <worktree>                                    # umzug runs only the ones that merged after setup
+```
+
+Or, when you want local to exactly match prod HEAD (or an incremental run hits a non-idempotent migration):
+
+```sh
+# full re-mirror — clean slate, drops fixtures / duplicated teams
+avoca-dev reset          # supabase db reset + re-dump CURRENT prod schema + reseed the ledger
+avoca-dev seed           # re-add fixtures (+ re-`duplicate-team` any you need)
+```
+
+Each pulled migration gets recorded in the local ledger, so a repeat `migrate up` is a clean no-op. This session's own example: merging `main` brought 4 newly-merged prod migrations that `migrate up` applied to local in one pass.
+
+### Push: author a migration → PR
+
+The other direction — a migration is **cheap to iterate while it's unmerged** and only becomes immutable once it deploys. The loop:
 
 ```sh
 # 1. write / edit the migration
