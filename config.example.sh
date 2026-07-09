@@ -30,6 +30,14 @@ PROD_PROJECT_REF="wmizcewjcybhvkpwpmim"
 # dump the schema. Typically the app's dev env — run `vercel env pull` there first.
 PROD_ENV_FILE="$AVOCA_NEXT_DIR/apps/web/.env.local"
 
+# Supabase personal access token (starts `sbp_`). The SANCTIONED prod-read path:
+# the Management API (api.supabase.com/v1/projects/<ref>/database/query) — the
+# same API the Supabase MCP wraps — instead of a raw pooler connection that trips
+# the authenticator alert. Mint one at supabase.com/dashboard/account/tokens
+# (needs Avoca-org access). `export` it so the spawned `supabase` CLI inherits it
+# too (no `supabase login` needed). Lives in config.sh (gitignored) — never commit it.
+# export SUPABASE_ACCESS_TOKEN="sbp_..."
+
 # Seeded password login (an @avoca.ai address gets system admin). With Google
 # OAuth wired (avoca-dev oauth) you can ignore this and just sign in with Google.
 LOGIN_EMAIL="dev@avoca.ai"
