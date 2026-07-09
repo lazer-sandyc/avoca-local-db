@@ -14,6 +14,8 @@
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
 #   avoca-dev db setprod [worktree] # revert it to the PROD db
 #   avoca-dev db status  [worktree] # show which db each app is on
+#   avoca-dev migrate [up|pending|executed] [wt]  # run unmerged migrations against LOCAL (the cheap loop)
+#   avoca-dev types      [worktree] # regen Supabase types from the LOCAL schema (not prod)
 #   avoca-dev up         [worktree] # seamless: point local + drop stale bundle + pnpm dev
 #   avoca-dev oauth <client-id> <secret>   # wire Google sign-in locally (needs a stack restart)
 #   avoca-dev trim                  # cut the Supabase stack to the ~7 containers we use
@@ -380,6 +382,45 @@ cmd_seed() {
   log "seed done. (Twilio: provision on demand from the UI or 'avoca-dev twilio provision'.)"
 }
 
+# ── migrate: run unmerged migrations against LOCAL (the cheap dev loop) ───
+# umzug reads the DISCRETE POSTGRES_* from process.env directly (no dotenv), and
+# builds its connection from them — NOT from POSTGRES_URL. `db setdev` writes those
+# into the worktree's apps/web/.env.local, but a bare `pnpm db:up` from packages/db
+# never loads that file, so it dies on "Missing POSTGRES_DB". We export the LOCAL
+# values inline here, which both closes that gap AND hard-pins the target to local
+# (127.0.0.1:54322) — this command can never touch prod, whatever the worktree env says.
+cmd_migrate() {
+  local action="${1:-up}"; shift || true
+  case "$action" in up|pending|executed|down) : ;; *) die "migrate action must be up|pending|executed|down (got '$action')";; esac
+  local wt; wt="$(resolve_worktree "${1:-}")"
+  lsql -tAc "select 1" >/dev/null 2>&1 || die "local DB unreachable at $LP_HOST:$LP_PORT — is the stack up? (avoca-dev setup)"
+  log "migrate $action → LOCAL $LP_HOST:$LP_PORT/$LP_DB  (worktree $(basename "$wt"))"
+  ( cd "$wt" \
+    && POSTGRES_HOST="$LP_HOST" POSTGRES_PORT="$LP_PORT" POSTGRES_DB="$LP_DB" \
+       POSTGRES_USER="$LP_USER" POSTGRES_PASSWORD="$LP_PASS" \
+       pnpm --filter @avoca/db "db:$action" )
+}
+
+# ── types: regenerate Supabase types from the LOCAL schema ────────────────
+# The repo's `gen-supabase-types` script hardcodes `--project-id <prod>`, so it
+# types against prod — wrong for the local-first loop, where you want types that
+# reflect the migration you just applied locally, BEFORE it's merged/deployed.
+# This generates from the local DB directly and writes the same generated file.
+cmd_types() {
+  need supabase
+  local wt; wt="$(resolve_worktree "${1:-}")"
+  local out="$wt/packages/db/src/generated/supabase.generated.ts"
+  [ -f "$out" ] || die "no generated types file at $out"
+  lsql -tAc "select 1" >/dev/null 2>&1 || die "local DB unreachable at $LP_HOST:$LP_PORT — is the stack up? (avoca-dev setup)"
+  log "regen Supabase types from LOCAL ($APP_SCHEMAS) → ${out#"$wt/"}"
+  local tmp; tmp="$(mktemp -t avoca-types.XXXX.ts)"
+  supabase gen types typescript --db-url "$LOCAL_PG_URL" --schema "$APP_SCHEMAS" > "$tmp" \
+    || { rm -f "$tmp"; die "type gen failed (is the supabase CLI current? is the stack up?)"; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "type gen produced an empty file — aborting (kept the existing types)"; }
+  mv "$tmp" "$out"
+  log "done. build the package to pick them up:  pnpm --filter @avoca/db build"
+}
+
 # ── db: point a worktree's env local <-> prod ─────────────────────────────
 BEGIN_MARK="# >>> avoca-dev managed: LOCAL db overrides (do not edit) >>>"
 END_MARK="# <<< avoca-dev managed <<<"
@@ -620,6 +661,8 @@ case "${1:-}" in
   grants)  shift; cmd_grants "$@";;
   ledger)  shift; cmd_ledger "$@";;
   seed)    shift; cmd_seed "$@";;
+  migrate) shift; cmd_migrate "$@";;
+  types)   shift; cmd_types "$@";;
   db)      shift; cmd_db "$@";;
   up)      shift; cmd_up "$@";;
   oauth)   shift; cmd_oauth "$@";;

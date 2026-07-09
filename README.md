@@ -9,8 +9,9 @@ seamless local dev loop. Prod is only ever **read** (a schema dump); it is never
 
 ## Why
 
-- **Iterate on migrations locally** — `db:up` runs your unmerged migrations against a copy
-  of prod's schema, and you can regenerate Supabase types from local.
+- **Iterate on migrations locally** — `avoca-dev migrate` runs your unmerged migrations against a
+  copy of prod's schema and `avoca-dev types` regenerates Supabase types from it, so you find the
+  right migration shape cheaply before it's merged. See [Migrations: cheap local loop → PR](#migrations-cheap-local-loop--pr).
 - **Test the real app end-to-end** — auth, `supabase.from()` queries, admin, everything —
   against synthetic teams/agents you control, not real customer data.
 - **No PII risk** — the mirror is schema-only; the only rows are the fixtures you seed.
@@ -66,6 +67,8 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | `avoca-dev db setdev [wt]` | Point a worktree's env (apps/web + apps/dashboard) at the **local** DB. |
 | `avoca-dev db setprod [wt]` | Revert it to **prod** (strips the local overrides). |
 | `avoca-dev db status [wt]` | Show which DB each app is on. |
+| `avoca-dev migrate [up\|pending\|executed\|down] [wt]` | Run the worktree's **unmerged** migrations against the LOCAL DB (default `up`). Wraps `pnpm db:up`, exporting the local `POSTGRES_*` umzug needs — and hard-pins the target to local, so it can never touch prod. |
+| `avoca-dev types [wt]` | Regenerate `packages/db/src/generated/supabase.generated.ts` from the **local** schema (the repo's own `gen-supabase-types` types against prod). Run it after `migrate` so your types reflect the migration you just applied, before it's merged. |
 | `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next` + `pnpm dev`, in one shot. |
 | `avoca-dev oauth <id> <secret>` | Wire Google sign-in on the local stack (needs a stack restart). |
 | `avoca-dev trim` | Cut the Supabase stack to the ~7 containers the app uses. |
@@ -75,6 +78,38 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | `avoca-dev status` | Show the stack, the DB, and which worktrees point where. |
 
 **Telephony lifecycle.** Twilio is **not** touched by `seed`. You provision a subaccount and buy numbers **from the app UI**, when you actually need them — these are real actions on Avoca's ISV Twilio account (subaccounts; any numbers you buy are real, ~$1/mo). The CLI's role is only **teardown + audit**: `avoca-dev twilio deprovision` reclaims subaccounts and `avoca-dev twilio status` audits them. `deprovision` is **tag-gated** — it can only ever close subaccounts whose FriendlyName carries the `avoca-dev-local` tag, never a real customer's. **When you close a plan/worktree, run `avoca-dev twilio deprovision`** (no arg) to reclaim everything, so nothing lingers on Avoca's account. So the UI-provisioned subaccounts are reclaimable, name any test teams you create with `avoca-dev-local`. (There's still an `avoca-dev twilio provision` fallback if you ever need to seed a subaccount without the UI.)
+
+## Migrations: cheap local loop → PR
+
+The point of the local DB is that a migration is **cheap to iterate while it's unmerged** and only becomes immutable once it deploys. The loop:
+
+```sh
+# 1. write / edit the migration
+$EDITOR <worktree>/packages/db/migrations/<ts>_<name>.sql
+
+# 2. apply it to LOCAL (only the unmerged ones run — the ledger is seeded from origin/main)
+avoca-dev migrate up <worktree>
+
+# 3. regen types from the LOCAL schema, so code sees the new columns before it's merged
+avoca-dev types <worktree>
+
+# 4. test against local (app, data-path tests). Not happy with the migration?
+#    while it's unmerged you just EDIT THE FILE and reapply from a clean slate:
+avoca-dev reset                 # rebuild schema from prod + reseed the ledger from origin/main
+avoca-dev migrate up <worktree> # your edited migration runs fresh
+avoca-dev seed                  # re-add fixtures
+```
+
+**Reapplying an edited migration.** Once a migration is in the local ledger, `migrate up` won't re-run it — `reset` is the clean reapply (it rebuilds the schema and reseeds the ledger from `origin/main`, so every unmerged migration, including your edited one, runs fresh). That's the whole reason to iterate locally: you can rewrite the *same* migration file as many times as review demands.
+
+**Convert to a PR.**
+
+1. Lint it: `pnpm --filter @avoca/db db:lint` (squawk).
+2. Commit the migration **and** the locally-regenerated `supabase.generated.ts` together.
+3. Open the PR. **While it's unmerged the migration file is still yours to edit** — respond to review by amending it in new commits (never rewrite history). This is exactly how `#13061` evolved: review moved it from `customer_phone` + `consumed_at` to `caller_id` + `received_call_id` + `source_call_id`, all in the same file, before merge.
+4. **The boundary:** once the PR **merges and deploys to prod**, that migration is frozen. Any further schema change is a *new* migration, never an edit to the old one — prod has already run it, and the ledger is append-only.
+
+So: mutate freely on local and in the open PR; append-only after deploy. The local DB lets you find the right shape before you cross that line.
 
 ## Copying real config from prod (`duplicate-bp` / `duplicate-team`)
 
