@@ -98,14 +98,13 @@ cmd_setup() {
   if [ "${existing:-0}" -gt 0 ]; then
     log "schema already loaded ($existing public tables); skipping load (use 'avoca-dev reset' to rebuild)"
   else
-    local prod_url; prod_url="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
-    [ -n "$prod_url" ] || die "no POSTGRES_URL in $PROD_ENV_FILE (run 'vercel env pull' there first)"
+    local prod_url; prod_url="$(_prod_url)"   # session endpoint + hardened via _prod_pgdump
     log "load prod schema (schema-only, READ-ONLY on prod)"
     lsql -q -c "DROP SCHEMA IF EXISTS public CASCADE; $(for s in "${SCHEMAS[@]}"; do [ "$s" = public ] || echo "DROP SCHEMA IF EXISTS $s CASCADE;"; done) CREATE SCHEMA public;"
     lsql -q -c "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gin SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public; CREATE EXTENSION IF NOT EXISTS moddatetime SCHEMA public; CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" SCHEMA public; CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public; CREATE EXTENSION IF NOT EXISTS citext SCHEMA public; CREATE EXTENSION IF NOT EXISTS unaccent SCHEMA public;"
     local args=(); for s in "${SCHEMAS[@]}"; do args+=(--schema="$s"); done
     local tmp; tmp="$(mktemp -t avoca-schema.XXXX.sql)"
-    pg_dump "$prod_url" --schema-only --no-owner --no-privileges "${args[@]}" \
+    _prod_pgdump "$prod_url" --schema-only --no-owner --no-privileges "${args[@]}" \
       | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
     lsql -v ON_ERROR_STOP=0 -q -f "$tmp" 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -20 || true
     rm -f "$tmp"
@@ -124,11 +123,58 @@ cmd_setup() {
 # models, transcribers, …) — global tables, no team scope, no PII. Copied
 # data-only from prod (READ-ONLY) and idempotent: --inserts --on-conflict-do-nothing
 # so re-running never duplicates. Edit REFERENCE_TABLES (config.sh) to add more.
-# The PROD Postgres url (read-only source for schema, reference data, dup copies).
+# ── prod reads: hardened + attributable ──────────────────────────────────
+# The transaction pooler (Supavisor) STRIPS libpq startup options — PGOPTIONS and a
+# startup application_name don't survive it (verified: read_only stayed off, app came
+# back 'Supavisor'). But it DOES honor `SET` sent as SQL on a session-mode (:5432)
+# connection. So we harden psql by injecting SETs, which the server then enforces:
+#   default_transaction_read_only=on — writes are IMPOSSIBLE (any write errors out)
+#   statement_timeout=60s            — no single query can run long
+#   lock_timeout=3s                  — never WAIT on a lock (can't block / be blocked)
+#   idle_in_transaction=120s         — a stalled session can't sit on its locks
+#   application_name=avoca-dev-local — every connection is name-tagged in pg_stat_activity
+# (All verified live: ro_txn=on, a write rejected, app=avoca-dev-local.)
+PROD_APPNAME="avoca-dev-local"
+# Client-side hard kill for a hung read (coreutils timeout/gtimeout if present; else skip).
+_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+# Our own independent record of every prod read (url redacted — no secrets on disk).
+PROD_AUDIT_LOG="${PROD_AUDIT_LOG:-$HOME/.avoca-dev/prod-reads.log}"
+_prod_audit() {
+  mkdir -p "$(dirname "$PROD_AUDIT_LOG")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$PROD_AUDIT_LOG" 2>/dev/null || true
+}
+_redact() { printf '%s' "$*" | sed -E 's#postgres(ql)?://[^[:space:]]*#<prod-url>#g'; }
+
+# The PROD Postgres url — READ-ONLY source for schema, reference data, dup copies.
+# Rewritten to the SESSION pooler endpoint (:5432): pg_dump needs session semantics,
+# and SET only persists for the session on a session-mode connection (not :6543).
 _prod_url() {
   local u; u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
   [ -n "$u" ] || die "no POSTGRES_URL in $PROD_ENV_FILE (run 'vercel env pull' there first)"
-  printf '%s\n' "$u"
+  printf '%s\n' "$(printf '%s' "$u" | sed -E 's#:6543/#:5432/#')"
+}
+
+# Hardened, audited prod psql. Call as: _prod_psql <url> [psql args…]. Injects the SETs
+# before the caller's query; under -q the SET tags don't leak into captured output (verified).
+# READ-ONLY (server-enforced), time-bounded, lock-yielding, name-tagged.
+_prod_psql() {
+  local url="$1"; shift
+  _prod_audit "psql $(_redact "$url $*")"
+  ${_TIMEOUT_BIN:+$_TIMEOUT_BIN 90} psql "$url" \
+    -c "SET default_transaction_read_only=on" \
+    -c "SET application_name='$PROD_APPNAME'" \
+    -c "SET statement_timeout=60000" \
+    -c "SET lock_timeout=3000" \
+    -c "SET idle_in_transaction_session_timeout=120000" \
+    "$@"
+}
+# Hardened, audited prod pg_dump. pg_dump is read-only by nature (SELECT + ACCESS SHARE
+# only) and takes no SET, and the pooler strips startup options — so it can't be
+# server-tagged (shows 'Supavisor'). It's bounded instead by --lock-wait-timeout + the
+# client-side timeout, is read-only by construction, and is captured in the audit log.
+_prod_pgdump() {
+  _prod_audit "pg_dump $(_redact "$*")"
+  ${_TIMEOUT_BIN:+$_TIMEOUT_BIN 180} pg_dump --lock-wait-timeout=3000 "$@"
 }
 
 cmd_reference() {
@@ -138,7 +184,7 @@ cmd_reference() {
   log "load reference data from prod (READ-ONLY): $REFERENCE_TABLES"
   for t in "${RTABLES[@]}"; do
     [ -n "$t" ] || continue
-    pg_dump "$prod_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
+    _prod_pgdump "$prod_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
       | lsql -q -v ON_ERROR_STOP=0 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -5 || true
     local n; n="$(lsql -tAc "select count(*) from $t" 2>/dev/null || echo '?')"
     log "  $t: $n rows"
@@ -166,7 +212,7 @@ _pull() {
   local cols; cols="$(_cols "$tbl")"
   [ -n "$cols" ] || die "unknown table: $tbl"
   local tmp; tmp="$(mktemp -t avoca-pull.XXXX)"
-  psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
+  _prod_psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
     || { cat "$tmp.err" >&2; rm -f "$tmp" "$tmp.err"; die "prod read failed for $tbl"; }
   local n; n="$(wc -l < "$tmp" | tr -d ' ')"
   lsql -q >/dev/null 2>&1 <<SQL
@@ -183,7 +229,7 @@ cmd_duplicate_bp() {
   local id="${1:?usage: avoca-dev duplicate-bp <blueprint_id>}"
   need psql
   local url; url="$(_prod_url)"
-  local name; name="$(psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
+  local name; name="$(_prod_psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
   [ -n "$name" ] || die "no blueprint '$id' in prod"
   log "duplicate blueprint '$id' from prod (READ-ONLY)"
   # idempotent: drop any prior copy first (FK triggers off, so order is free)
@@ -254,7 +300,7 @@ cmd_duplicate_team() {
   local team="${1:?usage: avoca-dev duplicate-team <team_id>}"
   need psql
   local url; url="$(_prod_url)"
-  local name; name="$(psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  local name; name="$(_prod_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
   [ -n "$name" ] || die "no team $team in prod"
   local ok; ok="$(lsql -tAc "select (exists(select 1 from profiles where id='$SEED_OWNER_ID') and exists(select 1 from enterprises where id=$SEED_ENTERPRISE_ID))::text" 2>/dev/null)"
   [ "$ok" = true ] || die "run 'avoca-dev seed' first — need the synthetic owner + enterprise to attach the copied team to"
@@ -296,7 +342,7 @@ update public.assistant_configs set vapi_assistant_id=null where team_id=$team;
 SQL
 
   # auto-pull any modular blueprints this team's agents reference
-  local bps; bps="$(psql "$url" -tAqc "
+  local bps; bps="$(_prod_psql "$url" -tAqc "
     select distinct v.blueprint_id from public.multi_agent_blueprint_versions v
     where v.id in (
       select blueprint_version_id from public.assistant_configs

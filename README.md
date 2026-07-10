@@ -158,6 +158,20 @@ Both commands are idempotent (they drop any prior copy first). Extend the team a
 3. Restart the stack: `(cd "$LOCAL_DB_DIR" && supabase stop && supabase start)` — preserves data.
 4. Browse the app at **http://127.0.0.1:3000** (matches the local `site_url`; cookies need one host).
 
+## Prod-read safety
+
+`avoca-dev` only ever **reads** prod, and every read is hardened so it cannot slow down or take down prod — and so it's attributable. All verified live against the Avoca project.
+
+- **Read-only, server-enforced.** Every `psql` prod read injects `SET default_transaction_read_only=on`; a write errors out (`cannot execute UPDATE in a read-only transaction`). It's the Postgres server refusing, not a promise in our code.
+- **Time-bounded + lock-yielding.** `statement_timeout=60s` (no query runs long), `lock_timeout=3s` (never *waits* on a lock — can't block or be blocked), `idle_in_transaction_session_timeout=120s` (a stalled session can't sit on locks). Plus a client-side `timeout` kill (needs coreutils `timeout`/`gtimeout`).
+- **Name-tagged.** `SET application_name='avoca-dev-local'` — every `psql` connection is identifiable in `pg_stat_activity` / Supabase logs, so during an incident it's filterable and instantly dismissable.
+- **Session endpoint (`:5432`).** The url is rewritten from the transaction pooler (`:6543`) to session mode. The transaction pooler **strips** libpq startup options (so `PGOPTIONS`/startup `application_name` silently don't apply — verified); session mode honors the `SET`s above.
+- **Audit log.** Every prod read appends to `~/.avoca-dev/prod-reads.log` (timestamp + operation, url redacted) — your own independent record of exactly what ran and when.
+
+**One honest limitation:** the `pg_dump` reads (the one-time schema mirror + the tiny reference tables) can't be server-tagged — `pg_dump` takes no `SET` and the pooler strips a startup `application_name`, so they surface as `Supavisor` in `pg_stat_activity`. They're still read-only **by nature** (`pg_dump` only issues `SELECT` + `ACCESS SHARE` locks), bounded by `--lock-wait-timeout=3000` + the client timeout, and captured in the audit log. Only the `psql` config reads (`duplicate-team`/`-bp`) get the full server-side tag.
+
+Net: a read-only, time-bounded, lock-yielding client that can't write or run long, self-identifying for `psql` reads, with your own audit trail for all of them. "Was it you?" → *filter `application_name=avoca-dev-local`, and here's my read log.*
+
 ## Gotchas (learned the hard way)
 
 - **`NEXT_PUBLIC_*` is compile-time.** The browser's Supabase URL is baked into the bundle when
