@@ -56,6 +56,23 @@ user, and seeds the umzug ledger so `migrate` only runs unmerged migrations. Ide
 - **Lookup dropdowns** (voices/llm_models): staging has none — `SOURCE_DB=production ./avoca-dev reference`
   fills them from prod (a small, hardened read) if you need working dropdowns.
 
+## Configuration — point it at your checkout
+
+`config.sh` (created by `setup.sh` from `config.example.sh`; gitignored, per-machine) holds your settings.
+The defaults assume the standard layout under `~/code/lazer/avoca/`. **If your `avoca-next` lives elsewhere,
+set these two in `config.sh` before running any worktree command:**
+
+- **`AVOCA_NEXT_DIR`** — your canonical `avoca-next` clone. Used to read the migration files and to seed the
+  umzug ledger from `origin/main`.
+- **`WORKTREES_DIR`** — where your `avoca-next` worktrees live. The worktree commands (`up`, `migrate`,
+  `types`, `db setdev`) take a `<slug>` and resolve it to `$WORKTREES_DIR/<slug>`. So
+  `./avoca-dev up call-transfer-linking-clean` looks for `$WORKTREES_DIR/call-transfer-linking-clean`.
+  (You can also pass an absolute path, or nothing = the canonical clone `AVOCA_NEXT_DIR`.)
+
+Precedence is **env > `config.sh` > default**, so you can also override per-command:
+`WORKTREES_DIR=/some/other/dir ./avoca-dev up my-branch`. Everything else (`SOURCE_DB`, `LOGIN_*`,
+`SUPABASE_EXCLUDE`, …) is re-read on every command — change it in `config.sh` anytime.
+
 ## Daily use
 
 ```sh
@@ -72,11 +89,11 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 
 | Command | What it does |
 |---|---|
-| `avoca-dev setup` | Stand up local Supabase, load prod's schema (schema-only), grant the Supabase roles, seed the migration ledger, load reference data. |
-| `avoca-dev reference` | (Re)load global lookup data the app needs — `voices`, `llm_models`, `transcribers` (the `REFERENCE_TABLES` list) — data-only from prod (READ-ONLY, no PII). Idempotent. |
-| `avoca-dev seed` | Load synthetic fixtures (`seed/*.sql`) + a login user. (No Twilio — provision on demand.) |
-| `avoca-dev duplicate-bp <id>` | Copy a modular blueprint (row + versions + assistant variables) from prod (READ-ONLY) so the builder / clone-from-template works. Idempotent. |
-| `avoca-dev duplicate-team <id>` | Copy a real prod team's **config** into local — agents, voice assistants, transfer destinations, variables, and any blueprints they use. **Not** its runtime data (calls/CRM/analytics); phone numbers are dropped. Also provisions a local Twilio **subaccount** (best-effort) so the team is testable — you still buy a test number manually in the UI. See safety notes below. |
+| `avoca-dev setup` | Stand up local Supabase and **snapshot staging** into it (schema + data), grant the Supabase roles, seed the umzug ledger, create the login user. (`SOURCE_DB=production` does a schema-only prod mirror instead.) |
+| `avoca-dev reference` | (Re)load global lookup data — `voices`, `llm_models`, `transcribers` (the `REFERENCE_TABLES` list) — from the source. Staging has these empty, so use `SOURCE_DB=production avoca-dev reference`. Idempotent. |
+| `avoca-dev seed` | Load synthetic test teams (`seed/base.sql` — English/Spanish agents for transfer tests). The login user is created by `setup`. |
+| `avoca-dev duplicate-bp <id>` | Copy a modular blueprint (row + versions + assistant variables) from the source (READ-ONLY) so the builder / clone-from-template works. Idempotent. |
+| `avoca-dev duplicate-team <id>` | Copy a team's **config** into local — agents, voice assistants, transfer destinations, variables, and any blueprints they use — from staging (default) or prod (`SOURCE_DB=production`). Config only: **not** runtime data (calls/CRM/analytics); phone numbers dropped, provider handles scrubbed, owner→synthetic. Does **not** touch Twilio (buy a test number in the UI if you need to place calls). |
 | `avoca-dev delete-team <id>` | Inverse of `duplicate-team` — releases the team's local Twilio subaccount (tag-gated) then purges its config from local. The DB is shared across all worktrees, so remove a test team when you're done with it (not per-worktree). |
 | `avoca-dev db setdev [wt]` | Point a worktree's env (apps/web + apps/dashboard) at the **local** DB. |
 | `avoca-dev db setprod [wt]` | Revert it to **prod** (strips the local overrides). |
