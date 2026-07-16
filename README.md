@@ -22,13 +22,23 @@ zero blast radius, then upstream them through the normal PR flow.
 
 ## Prerequisites
 
-- **A Docker engine** — Docker Desktop, OrbStack, colima, any of them. Required by the Supabase CLI
-  (`supabase start` runs Postgres + GoTrue auth + PostgREST + … as containers; there is no non-Docker mode).
-- The **Supabase CLI**, plus `psql` + `pg_dump` (Postgres 15+ client — `brew install libpq && brew link --force libpq`).
+Install the CLIs first (macOS / Homebrew):
+
+```sh
+brew install supabase/tap/supabase          # Supabase CLI — runs the local stack
+brew install libpq && brew link --force libpq   # psql + pg_dump (Postgres 15+ client)
+```
+
+Then make sure you have:
+
+- **A Docker engine running** — Docker Desktop, OrbStack, colima, any of them. The Supabase CLI runs
+  the stack (Postgres + GoTrue auth + PostgREST + …) as containers; there is no non-Docker mode.
 - **Your personal Postgres creds** from Jackson's 1Password share, saved to `~/.avoca/postgres.env`
-  (`chmod 600`) with `STAGING_POSTGRES_URL=…` and `PROD_POSTGRES_URL=…`. The snapshot reads staging
+  (`chmod 600`) with `STAGING_POSTGRES_URL=…` and `PROD_POSTGRES_URL=…`. `setup.sh` reads staging
   from here (read-only).
 - An **avoca-next clone** (for the migration files + worktrees).
+
+`setup.sh` checks all of these and tells you exactly what's missing before it does anything.
 
 ## Setup
 
