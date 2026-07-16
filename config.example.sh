@@ -26,8 +26,19 @@ REFERENCE_TABLES="voices,llm_models,transcribers"
 # .next bundle (the compile-time NEXT_PUBLIC split-brain).
 PROD_PROJECT_REF="wmizcewjcybhvkpwpmim"
 
-# File holding the PROD db url (POSTGRES_URL=…). `setup` reads it READ-ONLY to
-# dump the schema. Typically the app's dev env — run `vercel env pull` there first.
+# Which upstream avoca-dev READS to mirror schema / reference data / configs:
+#   staging (default) — never touches prod for everyday setup
+#   production        — only when you need prod-only config (e.g. an EAS team not on staging)
+# Override per-command: `SOURCE_DB=production avoca-dev duplicate-team <id>`.
+SOURCE_DB="staging"
+
+# Avoca's personal Postgres creds (Jackson's 1Password share): a file holding
+# STAGING_POSTGRES_URL=… and PROD_POSTGRES_URL=…. `_source_url` reads the one that
+# matches SOURCE_DB. chmod 600. This is the preferred source for both staging and prod.
+AVOCA_CREDS_FILE="$HOME/.avoca/postgres.env"
+
+# Legacy fallback for the PROD url only (used when AVOCA_CREDS_FILE isn't set up and
+# SOURCE_DB=production). The app's Vercel-pulled dev env — run `vercel env pull` there.
 PROD_ENV_FILE="$AVOCA_NEXT_DIR/apps/web/.env.local"
 
 # Supabase personal access token (starts `sbp_`). The SANCTIONED prod-read path:

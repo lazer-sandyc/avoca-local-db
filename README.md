@@ -1,46 +1,50 @@
 # avoca-local-dev
 
-A local development database for **avoca-next** — a schema-accurate mirror of prod that
-holds **no prod data / no PII**, so you can run the app, iterate on migrations, and test
-against your own synthetic fixtures without touching production.
+A **private local development database for avoca-next**, built as a **snapshot of staging**
+(schema + data). Staging's app schemas are small and carry no PII, so we just clone them into
+a local Supabase stack — giving you a database you can run the app against, migrate freely, and
+reset at will, **without touching prod or the shared staging DB**.
 
-One command flips a worktree between the local DB and prod, and one command starts a
-seamless local dev loop. Prod is only ever **read** (a schema dump); it is never written.
+Migrations you run here only affect *your* machine. They become real when your PR merges and the
+deploy pipeline applies them (to staging, then prod) — you never hand-migrate a shared database.
 
-## Why
+## Why not just use staging?
 
-- **Iterate on migrations locally** — `avoca-dev migrate` runs your unmerged migrations against a
-  copy of prod's schema and `avoca-dev types` regenerates Supabase types from it, so you find the
-  right migration shape cheaply before it's merged. See [Migrations: cheap local loop → PR](#migrations-cheap-local-loop--pr).
-- **Test the real app end-to-end** — auth, `supabase.from()` queries, admin, everything —
-  against synthetic teams/agents you control, not real customer data.
-- **No PII risk** — the mirror is schema-only; the only rows are the fixtures you seed.
+Jackson's personal creds point every dev at **one shared staging database**. That's great for
+running the *app* against a real backend, but a migration you run there changes the schema everyone
+else is testing on. This tool gives you an **isolated** copy so you can iterate on migrations with
+zero blast radius, then upstream them through the normal PR flow.
+
+- **Iterate on migrations locally** — `avoca-dev migrate` runs your unmerged migrations against the
+  local snapshot and `avoca-dev types` regenerates Supabase types from it. See [Migrations](#migrations-pull-prod--local-push-local--pr).
+- **Run the real app end-to-end** — auth, `supabase.from()`, admin — against a faithful copy of staging.
+- **No PII risk** — staging has no real calls/customers/bookings; auth is a fresh local instance, never copied.
 
 ## Prerequisites
 
-- **A Docker engine** — Docker Desktop, OrbStack, colima, Rancher Desktop, any of them. This is
-  required by the Supabase CLI: `supabase start` runs the stack (Postgres + GoTrue auth +
-  PostgREST + Kong gateway + …) as containers; there is no non-Docker mode. We use the Supabase
-  stack rather than a bare Postgres because the app needs auth (GoTrue) and every
-  `supabase.from()` query (PostgREST), and the prod schema dump assumes the Supabase base
-  (the `auth` schema + the `anon`/`authenticated`/`service_role` roles).
-- The Supabase CLI, plus `psql` + `pg_dump` (Postgres 15+ client).
-- An avoca-next clone with a working dev env (`vercel env pull` done in `apps/web`), so the
-  tool can read the prod DB url for the **schema** dump (read-only).
+- **A Docker engine** — Docker Desktop, OrbStack, colima, any of them. Required by the Supabase CLI
+  (`supabase start` runs Postgres + GoTrue auth + PostgREST + … as containers; there is no non-Docker mode).
+- The **Supabase CLI**, plus `psql` + `pg_dump` (Postgres 15+ client — `brew install libpq && brew link --force libpq`).
+- **Your personal Postgres creds** from Jackson's 1Password share, saved to `~/.avoca/postgres.env`
+  (`chmod 600`) with `STAGING_POSTGRES_URL=…` and `PROD_POSTGRES_URL=…`. The snapshot reads staging
+  from here (read-only).
+- An **avoca-next clone** (for the migration files + worktrees).
 
 ## Setup
 
 ```sh
-cp config.example.sh config.sh      # edit paths for your machine (or use env overrides)
-./avoca-dev setup                   # stand up the local Supabase stack + load prod's schema
-./avoca-dev seed                    # synthetic enterprise/teams/agents + a login user
+./setup.sh                          # checks prereqs + creds, then builds the local DB (staging snapshot + login user)
 ./avoca-dev db setdev <worktree>    # point your avoca-next worktree's env at the LOCAL db
 ```
 
-`setup` is one-time (idempotent; safe to re-run — it skips the schema load if it's already there). It also
-loads **reference data** — the global lookup tables the app needs to work (`voices`, `llm_models`,
-`transcribers`; the `REFERENCE_TABLES` list), copied data-only from prod (READ-ONLY, no PII). Add more tables
-to that list as you hit empty dropdowns, then re-run `avoca-dev reference`.
+That's it — `setup.sh` snapshots staging (schema + data, ~tens of MB), creates your `@avoca.ai` login
+user, and seeds the umzug ledger so `migrate` only runs unmerged migrations. Idempotent; re-run anytime
+(`avoca-dev reset` forces a fresh snapshot).
+
+- **Synthetic test teams** (optional): `./avoca-dev seed` adds English/Spanish agents on the same team
+  for transfer-linking-style tests.
+- **Lookup dropdowns** (voices/llm_models): staging has none — `SOURCE_DB=production ./avoca-dev reference`
+  fills them from prod (a small, hardened read) if you need working dropdowns.
 
 ## Daily use
 

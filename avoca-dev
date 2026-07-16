@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# avoca-dev — a local development database for avoca-next, without touching prod.
+# avoca-dev — a local development database for avoca-next, sourced from STAGING.
 #
-# Stands up a local Supabase stack, mirrors prod's SCHEMA (no data / no PII),
-# points a worktree's env at it, and gives you a one-command seamless dev loop.
-# Everything is reversible; prod is only ever read (schema dump), never written.
+# Stands up a local Supabase stack and SNAPSHOTS staging into it — schema + data,
+# since staging's app schemas are small and carry no PII. (SOURCE_DB=production instead
+# does a schema-only prod mirror.) Points a worktree's env at it and gives you a
+# one-command dev loop. Everything is reversible; the upstream is only ever read.
 #
-#   avoca-dev setup                 # one-time: stand up the local DB (schema-only mirror + reference data)
-#   avoca-dev reference             # (re)load global lookup data from prod (voices, llm_models, transcribers, …)
-#   avoca-dev seed                  # load synthetic test fixtures + a login user
-#   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from prod
-#   avoca-dev duplicate-team <id>   # copy a prod team's CONFIG from prod (no calls/PII; provider handles scrubbed)
+#   avoca-dev setup                 # one-time: snapshot staging into local (schema + data) + a login user
+#   avoca-dev reference             # (re)load global lookup data from the source (voices, llm_models, transcribers, …)
+#   avoca-dev seed                  # load synthetic test teams (English/Spanish agents for transfer tests)
+#   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from the source
+#   avoca-dev duplicate-team <id>   # copy a team's CONFIG from the source (no calls/PII; provider handles scrubbed)
 #   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
 #   avoca-dev db setprod [worktree] # revert it to the PROD db
@@ -38,7 +39,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"                      # schemas to mirror
 : "${REFERENCE_TABLES:=voices,llm_models,transcribers}"                  # global lookup data the app needs (no PII); copied data-only from prod
 : "${PROD_PROJECT_REF:=wmizcewjcybhvkpwpmim}"                            # prod supabase ref
-: "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # source of PROD db url (read-only)
+: "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # legacy fallback source of the PROD db url
+: "${AVOCA_CREDS_FILE:=$HOME/.avoca/postgres.env}"                       # Avoca's personal creds: STAGING_POSTGRES_URL + PROD_POSTGRES_URL
+: "${SOURCE_DB:=staging}"                                                # upstream avoca-dev READS from: staging (default) | production
 : "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
 : "${LOGIN_PASSWORD:=avoca-local-dev}"
 : "${LOGIN_NAME:=Local Dev}"
@@ -84,7 +87,9 @@ ptr_tag() {
   case "$u" in *127.0.0.1*|*localhost*) echo LOCAL;; "" ) echo "-";; *) echo prod;; esac
 }
 
-# ── setup: stand up the local DB as a schema-only mirror of prod ──────────
+# ── setup: stand up the local DB (staging snapshot by default) ────────────
+# STAGING (default): full schema+data snapshot of the app schemas (small, no PII).
+# PRODUCTION (SOURCE_DB=production): schema-only mirror + reference data (prod is huge/PII).
 cmd_setup() {
   need supabase; need psql; need pg_dump
   IFS=',' read -ra SCHEMAS <<< "$APP_SCHEMAS"
@@ -98,15 +103,34 @@ cmd_setup() {
   if [ "${existing:-0}" -gt 0 ]; then
     log "schema already loaded ($existing public tables); skipping load (use 'avoca-dev reset' to rebuild)"
   else
-    local prod_url; prod_url="$(_prod_url)"   # session endpoint + hardened via _prod_pgdump
-    log "load prod schema (schema-only, READ-ONLY on prod)"
+    local src_url; src_url="$(_source_url)"   # session endpoint + hardened via _src_pgdump
     lsql -q -c "DROP SCHEMA IF EXISTS public CASCADE; $(for s in "${SCHEMAS[@]}"; do [ "$s" = public ] || echo "DROP SCHEMA IF EXISTS $s CASCADE;"; done) CREATE SCHEMA public;"
     lsql -q -c "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gin SCHEMA public; CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public; CREATE EXTENSION IF NOT EXISTS moddatetime SCHEMA public; CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" SCHEMA public; CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public; CREATE EXTENSION IF NOT EXISTS citext SCHEMA public; CREATE EXTENSION IF NOT EXISTS unaccent SCHEMA public;"
     local args=(); for s in "${SCHEMAS[@]}"; do args+=(--schema="$s"); done
-    local tmp; tmp="$(mktemp -t avoca-schema.XXXX.sql)"
-    _prod_pgdump "$prod_url" --schema-only --no-owner --no-privileges "${args[@]}" \
-      | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
-    lsql -v ON_ERROR_STOP=0 -q -f "$tmp" 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -20 || true
+    local tmp; tmp="$(mktemp -t avoca-snapshot.XXXX.sql)"
+    case "$SOURCE_DB" in
+      production|prod)
+        # PROD: schema-only (prod data is huge + PII). Reference/config come via cmd_reference / duplicate-team.
+        log "load prod SCHEMA only (READ-ONLY; prod data is huge + has PII)"
+        _src_pgdump "$src_url" --schema-only --no-owner --no-privileges "${args[@]}" \
+          | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
+        lsql -v ON_ERROR_STOP=0 -q -f "$tmp" 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -20 || true
+        ;;
+      *)
+        # STAGING (default): full snapshot — schema + DATA. Staging's app schemas are only
+        # tens of MB and carry no real PII (calls/customers/bookings are empty), so we just
+        # clone them. Load with FK triggers OFF (session_replication_role=replica) so insert
+        # order and cross-schema FKs (e.g. public.profiles -> auth.users, which we don't copy)
+        # never block the restore.
+        log "snapshot $SOURCE_DB (schema + data, READ-ONLY) — app schemas only (~tens of MB, no PII)"
+        _src_pgdump "$src_url" --no-owner --no-privileges "${args[@]}" \
+          | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
+        lsql -v ON_ERROR_STOP=0 -q >/dev/null 2>&1 <<SQL || true
+SET session_replication_role = replica;
+\i $tmp
+SQL
+        ;;
+    esac
     rm -f "$tmp"
     local loaded; loaded="$(lsql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")"
     [ "${loaded:-0}" -gt 50 ] || die "schema load looks incomplete ($loaded public tables)"
@@ -115,15 +139,21 @@ cmd_setup() {
 
   cmd_grants
   cmd_ledger
-  cmd_reference
-  log "setup done. Next: avoca-dev seed  →  avoca-dev up <worktree>"
+  # Reference lookups (voices/llm_models/…): prod has them, staging is sparse. The staging
+  # snapshot already brought whatever staging had; only auto-pull from prod when mirroring prod.
+  case "$SOURCE_DB" in
+    production|prod) cmd_reference ;;
+    *) log "reference tables came from the $SOURCE_DB snapshot (staging is sparse — 'SOURCE_DB=production avoca-dev reference' fills voices/llm_models/… from prod if you need them)" ;;
+  esac
+  _seed_login   # so you can log in immediately (synthetic test teams are the separate 'seed' step)
+  log "setup done. You can log in now. Next: avoca-dev up <worktree>   (optional: avoca-dev seed for synthetic test teams)"
 }
 
 # Reference / lookup data the app genuinely needs to function (voice list, LLM
 # models, transcribers, …) — global tables, no team scope, no PII. Copied
-# data-only from prod (READ-ONLY) and idempotent: --inserts --on-conflict-do-nothing
+# data-only from  (READ-ONLY) and idempotent: --inserts --on-conflict-do-nothing
 # so re-running never duplicates. Edit REFERENCE_TABLES (config.sh) to add more.
-# ── prod reads: hardened + attributable ──────────────────────────────────
+# ── source reads: hardened + attributable ────────────────────────────────
 # The transaction pooler (Supavisor) STRIPS libpq startup options — PGOPTIONS and a
 # startup application_name don't survive it (verified: read_only stayed off, app came
 # back 'Supavisor'). But it DOES honor `SET` sent as SQL on a session-mode (:5432)
@@ -134,35 +164,48 @@ cmd_setup() {
 #   idle_in_transaction=120s         — a stalled session can't sit on its locks
 #   application_name=avoca-dev-local — every connection is name-tagged in pg_stat_activity
 # (All verified live: ro_txn=on, a write rejected, app=avoca-dev-local.)
-PROD_APPNAME="avoca-dev-local"
+SRC_APPNAME="avoca-dev-local"
 # Client-side hard kill for a hung read (coreutils timeout/gtimeout if present; else skip).
 _TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
-# Our own independent record of every prod read (url redacted — no secrets on disk).
-PROD_AUDIT_LOG="${PROD_AUDIT_LOG:-$HOME/.avoca-dev/prod-reads.log}"
-_prod_audit() {
-  mkdir -p "$(dirname "$PROD_AUDIT_LOG")" 2>/dev/null || true
-  printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$PROD_AUDIT_LOG" 2>/dev/null || true
+# Our own independent record of every source read (url redacted — no secrets on disk).
+SRC_AUDIT_LOG="${SRC_AUDIT_LOG:-$HOME/.avoca-dev/source-reads.log}"
+_src_audit() {
+  mkdir -p "$(dirname "$SRC_AUDIT_LOG")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$SRC_AUDIT_LOG" 2>/dev/null || true
 }
-_redact() { printf '%s' "$*" | sed -E 's#postgres(ql)?://[^[:space:]]*#<prod-url>#g'; }
+_redact() { printf '%s' "$*" | sed -E 's#postgres(ql)?://[^[:space:]]*#<source-url>#g'; }
 
-# The PROD Postgres url — READ-ONLY source for schema, reference data, dup copies.
+# The upstream Postgres url we READ to mirror schema / reference data / configs.
+# Defaults to STAGING (SOURCE_DB) from Avoca's ~/.avoca/postgres.env — so everyday
+# setup/reference never touches prod. Falls back to the app's Vercel-pulled POSTGRES_URL
+# only for SOURCE_DB=production on a machine not yet on ~/.avoca/postgres.env.
 # Rewritten to the SESSION pooler endpoint (:5432): pg_dump needs session semantics,
-# and SET only persists for the session on a session-mode connection (not :6543).
-_prod_url() {
-  local u; u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
-  [ -n "$u" ] || die "no POSTGRES_URL in $PROD_ENV_FILE (run 'vercel env pull' there first)"
+# and the SET-based hardening only persists on a session-mode connection (not :6543).
+_source_url() {
+  local key u
+  case "$SOURCE_DB" in
+    staging|stage)   key=STAGING_POSTGRES_URL ;;
+    production|prod) key=PROD_POSTGRES_URL ;;
+    *) die "SOURCE_DB must be 'staging' or 'production' (got '$SOURCE_DB')" ;;
+  esac
+  if [ -f "$AVOCA_CREDS_FILE" ] && grep -qE "^$key=" "$AVOCA_CREDS_FILE"; then
+    u="$(grep -E "^$key=" "$AVOCA_CREDS_FILE" | tail -1 | cut -d= -f2- | tr -d '"')"
+  elif [ "$SOURCE_DB" = production ] || [ "$SOURCE_DB" = prod ]; then
+    u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"  # legacy fallback
+  fi
+  [ -n "${u:-}" ] || die "no $key in $AVOCA_CREDS_FILE — paste your creds there (1Password), or run with SOURCE_DB=production"
   printf '%s\n' "$(printf '%s' "$u" | sed -E 's#:6543/#:5432/#')"
 }
 
-# Hardened, audited prod psql. Call as: _prod_psql <url> [psql args…]. Injects the SETs
+# Hardened, audited prod psql. Call as: _src_psql <url> [psql args…]. Injects the SETs
 # before the caller's query; under -q the SET tags don't leak into captured output (verified).
 # READ-ONLY (server-enforced), time-bounded, lock-yielding, name-tagged.
-_prod_psql() {
+_src_psql() {
   local url="$1"; shift
-  _prod_audit "psql $(_redact "$url $*")"
+  _src_audit "psql $(_redact "$url $*")"
   ${_TIMEOUT_BIN:+$_TIMEOUT_BIN 90} psql "$url" \
     -c "SET default_transaction_read_only=on" \
-    -c "SET application_name='$PROD_APPNAME'" \
+    -c "SET application_name='$SRC_APPNAME'" \
     -c "SET statement_timeout=60000" \
     -c "SET lock_timeout=3000" \
     -c "SET idle_in_transaction_session_timeout=120000" \
@@ -172,19 +215,19 @@ _prod_psql() {
 # only) and takes no SET, and the pooler strips startup options — so it can't be
 # server-tagged (shows 'Supavisor'). It's bounded instead by --lock-wait-timeout + the
 # client-side timeout, is read-only by construction, and is captured in the audit log.
-_prod_pgdump() {
-  _prod_audit "pg_dump $(_redact "$*")"
+_src_pgdump() {
+  _src_audit "pg_dump $(_redact "$*")"
   ${_TIMEOUT_BIN:+$_TIMEOUT_BIN 180} pg_dump --lock-wait-timeout=3000 "$@"
 }
 
 cmd_reference() {
   need psql; need pg_dump
-  local prod_url; prod_url="$(_prod_url)"
+  local src_url; src_url="$(_source_url)"
   IFS=',' read -ra RTABLES <<< "$REFERENCE_TABLES"
-  log "load reference data from prod (READ-ONLY): $REFERENCE_TABLES"
+  log "load reference data from $SOURCE_DB (READ-ONLY): $REFERENCE_TABLES"
   for t in "${RTABLES[@]}"; do
     [ -n "$t" ] || continue
-    _prod_pgdump "$prod_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
+    _src_pgdump "$src_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
       | lsql -q -v ON_ERROR_STOP=0 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -5 || true
     local n; n="$(lsql -tAc "select count(*) from $t" 2>/dev/null || echo '?')"
     log "  $t: $n rows"
@@ -205,14 +248,14 @@ _cols() {
              where table_schema='public' and table_name='$1' and is_generated='NEVER'"
 }
 
-# Copy rows prod -> local for one table.  _pull <prod_url> <table> <where-sql>
+# Copy rows prod -> local for one table.  _pull <src_url> <table> <where-sql>
 # Runs under replica role; caller is responsible for clearing stale rows first.
 _pull() {
   local url="$1" tbl="$2" where="$3"
   local cols; cols="$(_cols "$tbl")"
   [ -n "$cols" ] || die "unknown table: $tbl"
   local tmp; tmp="$(mktemp -t avoca-pull.XXXX)"
-  _prod_psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
+  _src_psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
     || { cat "$tmp.err" >&2; rm -f "$tmp" "$tmp.err"; die "prod read failed for $tbl"; }
   local n; n="$(wc -l < "$tmp" | tr -d ' ')"
   lsql -q >/dev/null 2>&1 <<SQL
@@ -228,10 +271,10 @@ SQL
 cmd_duplicate_bp() {
   local id="${1:?usage: avoca-dev duplicate-bp <blueprint_id>}"
   need psql
-  local url; url="$(_prod_url)"
-  local name; name="$(_prod_psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
+  local url; url="$(_source_url)"
+  local name; name="$(_src_psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
   [ -n "$name" ] || die "no blueprint '$id' in prod"
-  log "duplicate blueprint '$id' from prod (READ-ONLY)"
+  log "duplicate blueprint '$id' from  (READ-ONLY)"
   # idempotent: drop any prior copy first (FK triggers off, so order is free)
   lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
@@ -299,12 +342,12 @@ cmd_delete_team() {
 cmd_duplicate_team() {
   local team="${1:?usage: avoca-dev duplicate-team <team_id>}"
   need psql
-  local url; url="$(_prod_url)"
-  local name; name="$(_prod_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  local url; url="$(_source_url)"
+  local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
   [ -n "$name" ] || die "no team $team in prod"
   local ok; ok="$(lsql -tAc "select (exists(select 1 from profiles where id='$SEED_OWNER_ID') and exists(select 1 from enterprises where id=$SEED_ENTERPRISE_ID))::text" 2>/dev/null)"
   [ "$ok" = true ] || die "run 'avoca-dev seed' first — need the synthetic owner + enterprise to attach the copied team to"
-  log "duplicate team $team ('$name') from prod (READ-ONLY; config only; provider handles scrubbed)"
+  log "duplicate team $team ('$name') from  (READ-ONLY; config only; provider handles scrubbed)"
 
   _purge_team_local "$team"   # drop any prior copy so re-runs are idempotent
 
@@ -342,7 +385,7 @@ update public.assistant_configs set vapi_assistant_id=null where team_id=$team;
 SQL
 
   # auto-pull any modular blueprints this team's agents reference
-  local bps; bps="$(_prod_psql "$url" -tAqc "
+  local bps; bps="$(_src_psql "$url" -tAqc "
     select distinct v.blueprint_id from public.multi_agent_blueprint_versions v
     where v.id in (
       select blueprint_version_id from public.assistant_configs
@@ -416,13 +459,21 @@ cmd_reset() {
   cmd_setup
 }
 
-# ── seed: synthetic fixtures + a login user ───────────────────────────────
+# Create a LOCAL login user (auth.users + identity + profile) so you can sign in.
+# Independent of staging/prod auth — we never copy those. Idempotent. Run by both
+# `setup` (so login works out of the box) and `seed`.
+_seed_login() {
+  need psql
+  log "seed login user $LOGIN_EMAIL / $LOGIN_PASSWORD (@avoca.ai => system admin)"
+  lsql -q -v email="$LOGIN_EMAIL" -v pass="$LOGIN_PASSWORD" -v fullname="$LOGIN_NAME" -f "$SELF_DIR/seed/login-user.sql" 2>&1 | grep -iE 'error|confirmed|bcrypt|identity|profile' | head -10 || true
+}
+
+# ── seed: synthetic test fixtures (login user comes from setup) ────────────
 cmd_seed() {
   need psql
   log "load synthetic fixtures (enterprise + teams + agents + transfer destinations)"
   lsql -q -f "$SELF_DIR/seed/base.sql" 2>&1 | grep -iE 'error|^ *[a-z].*\| *[0-9]' | head -20 || true
-  log "seed login user $LOGIN_EMAIL / $LOGIN_PASSWORD (@avoca.ai => system admin)"
-  lsql -q -v email="$LOGIN_EMAIL" -v pass="$LOGIN_PASSWORD" -v fullname="$LOGIN_NAME" -f "$SELF_DIR/seed/login-user.sql" 2>&1 | grep -iE 'error|confirmed|bcrypt|identity|profile' | head -10 || true
+  _seed_login
   # Twilio subaccounts are NOT provisioned here — do it on demand from the app UI,
   # or with 'avoca-dev twilio provision' when you actually need to buy numbers.
   log "seed done. (Twilio: provision on demand from the UI or 'avoca-dev twilio provision'.)"
@@ -476,6 +527,11 @@ strip_block() {
     index($0,b)==1 || index($0,"# --- shared local DB")==1 || index($0,"# >>> point-db managed")==1 { stop=1 }
     stop { next } { print }
   ' "$f" > "$f.adv1"
+  # DB-only: strip the managed DB overrides. App-URL vars (WEB_APP_URL,
+  # NEXT_PUBLIC_WEB_APP_URL, NEXT_PUBLIC_DASHBOARD_URL) are NOT touched here —
+  # they belong to the worktree's env (FDE overrides / tunnel), not the DB switch.
+  # The localhost app-URL lines are still stripped once, to clean up any env a
+  # prior (coupled) version of this command wrote.
   grep -vxF -e "POSTGRES_HOST=127.0.0.1" -e "POSTGRES_PORT=54322" -e "POSTGRES_DB=postgres" \
     -e "POSTGRES_USER=postgres" -e "POSTGRES_PASSWORD=postgres" \
     -e "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API" \
