@@ -406,19 +406,13 @@ SQL
     fi
   done
 
-  # Give the team a local Twilio SUBACCOUNT so it's immediately testable — best
-  # effort: only if ISV creds + python3 are present, never blocks the copy. This
-  # creates the subaccount only; you still buy a test NUMBER manually in the UI
-  # ("Provision Test Number"). Reclaim it (and the team) with 'delete-team'.
-  if command -v python3 >/dev/null 2>&1 && _twilio_creds_soft; then
-    log "provisioning local Twilio subaccount for team $team (idempotent)…"
-    ( _tw_provision_one "$team" ) || log "  twilio provisioning incomplete (non-fatal) — retry: avoca-dev twilio provision $team"
-  else
-    log "skipping Twilio subaccount (no ISV creds / python3) — run 'avoca-dev twilio provision $team' when you need to test calls"
-  fi
-
+  # NOTE: cloning is CONFIG-ONLY — it deliberately does NOT touch Twilio. The value
+  # here is not rebuilding a team's blueprint/agents from scratch; the telephony bits
+  # are a quick manual UI step when (if) you actually need to place a call, and
+  # auto-provisioning real (billed) subaccounts on every clone is over-automation.
+  # If you do need to test calls on this team: 'avoca-dev twilio provision $team'
+  # then buy a test number in the UI.
   log "done — team $team ('$name') is in local (config only; numbers dropped; provider handles scrubbed; owner→synthetic)."
-  log "  telephony: buy a test number in the UI (Provision Test Number) on the local subaccount to test calls."
 }
 
 # Supabase role grants (pg_dump --no-privileges strips these; without them the
