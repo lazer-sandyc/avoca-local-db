@@ -42,6 +42,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # legacy fallback source of the PROD db url
 : "${AVOCA_CREDS_FILE:=$HOME/.avoca/postgres.env}"                       # Avoca's personal creds: STAGING_POSTGRES_URL + PROD_POSTGRES_URL
 : "${SOURCE_DB:=staging}"                                                # upstream avoca-dev READS from: staging (default) | production
+: "${SUPABASE_EXCLUDE:=logflare,vector}"                                 # containers to skip on 'supabase start' (analytics stack is flaky + unneeded for dev)
 : "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
 : "${LOGIN_PASSWORD:=avoca-local-dev}"
 : "${LOGIN_NAME:=Local Dev}"
@@ -97,7 +98,7 @@ cmd_setup() {
   log "supabase stack in $LOCAL_DB_DIR"
   mkdir -p "$LOCAL_DB_DIR"
   [ -f "$LOCAL_DB_DIR/supabase/config.toml" ] || ( cd "$LOCAL_DB_DIR" && yes n | supabase init >/dev/null 2>&1 || true )
-  ( cd "$LOCAL_DB_DIR" && supabase start ) || die "supabase start failed"
+  ( cd "$LOCAL_DB_DIR" && supabase start ${SUPABASE_EXCLUDE:+-x "$SUPABASE_EXCLUDE"} ) || die "supabase start failed (try 'supabase start --debug' in $LOCAL_DB_DIR; or widen SUPABASE_EXCLUDE)"
 
   local existing; existing="$(lsql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo 0)"
   if [ "${existing:-0}" -gt 0 ]; then
