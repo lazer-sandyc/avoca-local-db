@@ -275,7 +275,7 @@ cmd_duplicate_bp() {
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
   [ -n "$name" ] || die "no blueprint '$id' in prod"
-  log "duplicate blueprint '$id' from  (READ-ONLY)"
+  log "duplicate blueprint '$id' from $SOURCE_DB (READ-ONLY)"
   # idempotent: drop any prior copy first (FK triggers off, so order is free)
   lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
@@ -348,7 +348,7 @@ cmd_duplicate_team() {
   [ -n "$name" ] || die "no team $team in prod"
   local ok; ok="$(lsql -tAc "select (exists(select 1 from profiles where id='$SEED_OWNER_ID') and exists(select 1 from enterprises where id=$SEED_ENTERPRISE_ID))::text" 2>/dev/null)"
   [ "$ok" = true ] || die "run 'avoca-dev seed' first — need the synthetic owner + enterprise to attach the copied team to"
-  log "duplicate team $team ('$name') from  (READ-ONLY; config only; provider handles scrubbed)"
+  log "duplicate team $team ('$name') from $SOURCE_DB (READ-ONLY; config only; provider handles scrubbed)"
 
   _purge_team_local "$team"   # drop any prior copy so re-runs are idempotent
 
