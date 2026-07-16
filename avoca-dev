@@ -44,7 +44,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SOURCE_DB:=staging}"                                                # upstream avoca-dev READS from: staging (default) | production
 : "${SUPABASE_EXCLUDE:=logflare,vector}"                                 # containers to skip on 'supabase start' (analytics stack is flaky + unneeded for dev)
 : "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
-: "${LOGIN_PASSWORD:=avoca-local-dev}"
+: "${LOGIN_PASSWORD:=avoca-password}"
 : "${LOGIN_NAME:=Local Dev}"
 # Synthetic owner + enterprise a duplicated prod team is re-attached to, so we
 # never copy real owner PII (auth.users/profiles). Must match seed/base.sql.

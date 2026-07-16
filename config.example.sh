@@ -53,5 +53,5 @@
 # Seeded password login (an @avoca.ai address gets system admin). With Google OAuth
 # wired (avoca-dev oauth) you can ignore this and just sign in with Google.
 : "${LOGIN_EMAIL:=dev@avoca.ai}"
-: "${LOGIN_PASSWORD:=avoca-local-dev}"
+: "${LOGIN_PASSWORD:=avoca-password}"
 : "${LOGIN_NAME:=Local Dev}"
