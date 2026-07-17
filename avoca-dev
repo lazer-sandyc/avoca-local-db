@@ -10,9 +10,9 @@
 #   avoca-dev reference             # (re)load global lookup data from the source (voices, llm_models, transcribers, …)
 #   avoca-dev seed                  # load synthetic test teams (English/Spanish agents for transfer tests)
 #   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from the source
-#   avoca-dev duplicate-team <id>   # copy a team's CONFIG from the source (no calls/PII; provider handles scrubbed)
-#   avoca-dev duplicate-team <id> --with-calls[=N]  # ...and also import its newest N real calls (default 50)
-#   avoca-dev dup-calls      <id> [--since <days> | --limit <n>]  # import a bounded slice of a team's real call history
+#   avoca-dev duplicate-team <id>   # copy a team's CONFIG + its last week of real calls (calls need SOURCE_DB=production)
+#   avoca-dev duplicate-team <id> --no-calls | --since <days> | --limit <n>   # config-only / widen / cap the call import
+#   avoca-dev dup-calls      <id> [--since <days> | --limit <n>]  # import real calls into an already-cloned local team (default: last week)
 #   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
 #   avoca-dev db up|down|cycle      # start / stop / restart the local Supabase stack (handles the -x excludes)
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
@@ -363,13 +363,21 @@ cmd_delete_team() {
 # the synthetic seed owner/enterprise so no owner PII is copied. Referenced
 # modular blueprints are auto-pulled. Idempotent (drops any prior copy first).
 cmd_duplicate_team() {
-  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--with-calls[=N]]}"; shift || true
-  local with_calls=""   # empty = config only; else newest-N real calls to also import
+  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls]}"; shift || true
+  # By DEFAULT we also import the team's last week of real calls. This only yields data
+  # when SOURCE_DB=production (calls live in prod; staging is call-empty), so it's a
+  # harmless no-op on the default staging source. --no-calls = config only (no call PII).
+  local calls_since=7 calls_limit="" calls_off=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --with-calls)   with_calls=50; shift;;
-      --with-calls=*) with_calls="${1#*=}"; shift;;
-      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--with-calls[=N]])";;
+      --no-calls)     calls_off=1; shift;;
+      --with-calls)   shift;;                       # accepted alias — default is already on
+      --with-calls=*) calls_limit="${1#*=}"; shift;;
+      --since)        calls_since="${2:?--since needs a number of days}"; shift 2;;
+      --since=*)      calls_since="${1#*=}"; shift;;
+      --limit)        calls_limit="${2:?--limit needs a number}"; shift 2;;
+      --limit=*)      calls_limit="${1#*=}"; shift;;
+      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls])";;
     esac
   done
   need psql
@@ -442,8 +450,11 @@ SQL
   # auto-provisioning real (billed) subaccounts on every clone is over-automation.
   # If you do need to test calls on this team: 'avoca-dev twilio provision $team'
   # then buy a test number in the UI.
-  log "done — team $team ('$name') is in local (config only; numbers dropped; provider handles scrubbed; owner→synthetic)."
-  [ -n "$with_calls" ] && cmd_dup_calls "$team" --limit "$with_calls"
+  log "done — team $team ('$name') config is in local (numbers dropped; provider handles scrubbed; owner→synthetic)."
+  if [ -z "$calls_off" ]; then
+    if [ -n "$calls_limit" ]; then cmd_dup_calls "$team" --limit "$calls_limit"
+    else cmd_dup_calls "$team" --since "$calls_since"; fi
+  fi
 }
 
 # dup-calls <team_id> [--since <days> | --limit <n>]: copy a BOUNDED slice of a team's
@@ -468,7 +479,7 @@ cmd_dup_calls() {
     esac
   done
   [ -n "$since_days" ] && [ -n "$limit_n" ] && die "use --since OR --limit, not both"
-  [ -n "$since_days$limit_n" ] || limit_n=50   # default: newest 50 calls
+  [ -n "$since_days$limit_n" ] || since_days=7   # default: last week of calls
   case "$since_days$limit_n" in *[!0-9]*) die "--since/--limit take a plain number";; esac
 
   local url; url="$(_source_url)"
