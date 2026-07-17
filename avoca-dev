@@ -671,18 +671,32 @@ cmd_cron() {
   esac
 }
 _cron_allowlist() { grep -E '^INNGEST_LOCAL_ENABLED_CRONS=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true; }
+# Crons that need EXTRA env beyond being enabled (the var is usually read in a helper the
+# cron imports, so it can't be auto-detected reliably). THE LIST GROWS — add a cron -> var
+# here whenever you find one. Space-separated if a cron needs more than one.
+_cron_env_hint() {
+  case "$1" in
+    call-flow-recording-stitch-cron) echo "CALL_FLOW_STITCH_TEAM_IDS" ;;
+    *) echo "" ;;
+  esac
+}
 _cron_ls() {
   local wt; wt="$(resolve_worktree "${1:-}")"
-  local on; on="$(_cron_allowlist "$wt/apps/web/.env.local")"
-  echo "inngest crons in $(basename "$wt")  (● = enabled locally):"
-  local f id sched mark
+  local envf="$wt/apps/web/.env.local"
+  local on; on="$(_cron_allowlist "$envf")"
+  echo "inngest crons in $(basename "$wt")  (● enabled · ⚠ needs env that's unset):"
+  local f id sched mark need v extra
   for f in "$wt"/apps/web/lib/inngest/functions/*.ts; do
     grep -q "{ cron:" "$f" 2>/dev/null || continue
     id="$(grep -oE "id: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/id: //; s/'//g" || true)"
     [ -n "$id" ] || continue
     sched="$(grep -oE "cron: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/cron: //; s/'//g" || true)"
     case ",$on," in *",$id,"*) mark='●';; *) mark=' ';; esac
-    printf '  %s %-46s %s\n' "$mark" "$id" "$sched"
+    extra=""; need="$(_cron_env_hint "$id")"
+    for v in $need; do
+      if grep -qE "^$v=" "$envf" 2>/dev/null; then extra="$extra  needs $v ✓"; else extra="$extra  ⚠ needs $v"; fi
+    done
+    printf '  %s %-46s %-14s%s\n' "$mark" "$id" "$sched" "$extra"
   done
 }
 _cron_set() {
