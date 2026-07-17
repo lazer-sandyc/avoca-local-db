@@ -22,20 +22,34 @@ zero blast radius, then upstream them through the normal PR flow.
 
 ## Prerequisites
 
-Install the CLIs first (macOS / Homebrew):
+Install the Supabase CLI (macOS / Homebrew):
 
 ```sh
-brew install supabase/tap/supabase          # Supabase CLI — runs the local stack
-brew install libpq && brew link --force libpq   # psql + pg_dump (Postgres 15+ client)
+brew install supabase/tap/supabase          # runs the local stack
 ```
+
+You also need **`psql` + `pg_dump`** (Postgres 15+). Check first — `which psql pg_dump`. If you
+already have them (a `postgresql@NN` formula or Postgres.app), you're set. Only if missing:
+`brew install libpq && brew link --force libpq`. (If that link **errors** because a `postgresql@NN`
+already owns `psql`/`pg_dump`/`clusterdb`, you already have them — skip `libpq`, don't `--overwrite`.)
 
 Then make sure you have:
 
 - **A Docker engine running** — Docker Desktop, OrbStack, colima, any of them. The Supabase CLI runs
   the stack (Postgres + GoTrue auth + PostgREST + …) as containers; there is no non-Docker mode.
-- **Your personal Postgres creds** from Jackson's 1Password share, saved to `~/.avoca/postgres.env`
-  (`chmod 600`) with `STAGING_POSTGRES_URL=…` and `PROD_POSTGRES_URL=…`. `setup.sh` reads staging
-  from here (read-only).
+- **Your personal Postgres creds** — this is the one thing you set up **yourself, once**. The creds
+  are personal (per developer), so they can't ship with the tool. Get them from **Jackson's 1Password
+  share**, then create the file Avoca's tooling reads:
+  ```sh
+  mkdir -p ~/.avoca && chmod 700 ~/.avoca
+  cat > ~/.avoca/postgres.env <<'EOF'
+  STAGING_POSTGRES_URL=postgres://...   # from the 1Password share
+  PROD_POSTGRES_URL=postgres://...      # from the 1Password share
+  EOF
+  chmod 600 ~/.avoca/postgres.env
+  ```
+  The tool only ever **reads** this (never writes it); `~/.avoca/postgres.env` is Avoca's standard
+  location (the same one `pnpm setup:staging-dev` uses).
 - An **avoca-next clone** (for the migration files + worktrees).
 
 `setup.sh` checks all of these and tells you exactly what's missing before it does anything.

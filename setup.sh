@@ -18,7 +18,7 @@ for c in docker supabase psql pg_dump; do
     case "$c" in
       docker)       die "missing 'docker' — install a Docker engine (Docker Desktop, OrbStack, or colima).";;
       supabase)     die "missing the 'supabase' CLI — brew install supabase/tap/supabase";;
-      psql|pg_dump) die "missing '$c' (Postgres client) — brew install libpq && brew link --force libpq";;
+      psql|pg_dump) die "missing '$c' (Postgres client) — 'brew install libpq && brew link --force libpq', or any postgresql@NN formula / Postgres.app";;
     esac
   fi
 done
