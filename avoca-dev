@@ -719,8 +719,8 @@ cmd_db() {
   local WEB_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD NEXT_PUBLIC_DASHBOARD_URL"
   local DASH_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_URL WEB_APP_URL NEXT_PUBLIC_WEB_APP_URL"
 
-  strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
   if [ "$action" = setprod ] || [ "$action" = prod ]; then
+    strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
     _enable_dupes "$web"; [ -f "$dash" ] && _enable_dupes "$dash"
     _wipe_next "$wt"
     log "$(basename "$wt") → PROD (restored originals; reverts to Vercel-pulled values; .next wiped)"
@@ -728,8 +728,13 @@ cmd_db() {
   fi
   [ "$action" = setdev ] || [ "$action" = dev ] || [ "$action" = local ] || die "action must be setdev, setprod, or status"
 
+  # Read the local keys BEFORE mutating any env file. If the stack is down, sbval returns
+  # empty — fail HERE with the file untouched, rather than after strip_block/_disable_dupes
+  # (which would leave the originals commented AND no managed block = zero live Supabase URL).
   local anon svc; anon="$(sbval "$env" ANON_KEY)"; svc="$(sbval "$env" SERVICE_ROLE_KEY)"
-  [ -n "$anon" ] && [ -n "$svc" ] || die "couldn't read local Supabase keys — is the stack up? (avoca-dev setup)"
+  [ -n "$anon" ] && [ -n "$svc" ] || die "couldn't read local Supabase keys — is the stack up? (run: avoca-dev db up)"
+
+  strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
   _disable_dupes "$web" $WEB_DUP_KEYS
   { echo ""; echo "$BEGIN_MARK"
     echo "POSTGRES_HOST=127.0.0.1"; echo "POSTGRES_PORT=54322"; echo "POSTGRES_DB=postgres"
