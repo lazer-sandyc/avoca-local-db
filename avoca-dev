@@ -670,7 +670,7 @@ cmd_cron() {
     *) die "cron action must be: ls [wt] | add <id> [wt] | rm <id> [wt]" ;;
   esac
 }
-_cron_allowlist() { grep -E '^INNGEST_LOCAL_ENABLED_CRONS=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'; }
+_cron_allowlist() { grep -E '^INNGEST_LOCAL_ENABLED_CRONS=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true; }
 _cron_ls() {
   local wt; wt="$(resolve_worktree "${1:-}")"
   local on; on="$(_cron_allowlist "$wt/apps/web/.env.local")"
@@ -678,9 +678,9 @@ _cron_ls() {
   local f id sched mark
   for f in "$wt"/apps/web/lib/inngest/functions/*.ts; do
     grep -q "{ cron:" "$f" 2>/dev/null || continue
-    id="$(grep -oE "id: '[^']+'" "$f" | head -1 | sed "s/id: //; s/'//g")"
+    id="$(grep -oE "id: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/id: //; s/'//g" || true)"
     [ -n "$id" ] || continue
-    sched="$(grep -oE "cron: '[^']+'" "$f" | head -1 | sed "s/cron: //; s/'//g")"
+    sched="$(grep -oE "cron: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/cron: //; s/'//g" || true)"
     case ",$on," in *",$id,"*) mark='●';; *) mark=' ';; esac
     printf '  %s %-46s %s\n' "$mark" "$id" "$sched"
   done
