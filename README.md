@@ -57,18 +57,23 @@ Then make sure you have:
 ## Setup
 
 ```sh
-./setup.sh                          # checks prereqs + creds, then builds the local DB (staging snapshot + login user)
-./avoca-dev db setdev <worktree>    # point your avoca-next worktree's env at the LOCAL db
+./setup.sh          # 1st run: creates config.sh, then stops so you can set your paths
+$EDITOR config.sh   # set AVOCA_NEXT_DIR + WORKTREES_DIR to YOUR paths (see Configuration below)
+./setup.sh          # builds the local DB: staging snapshot + prod global config + login user
 ```
 
-That's it — `setup.sh` snapshots staging (schema + data, ~tens of MB), creates your `@avoca.ai` login
-user, and seeds the umzug ledger so `migrate` only runs unmerged migrations. Idempotent; re-run anytime
-(`avoca-dev reset` forces a fresh snapshot).
+`setup.sh` is idempotent — re-run anytime (`avoca-dev reset` forces a fresh snapshot). It snapshots
+staging (schema + data, ~tens of MB), syncs global config from prod (`voices`/`llm_models`/**`feature_flags`**),
+and creates your login (`avoca-user@avoca.ai` / `avoca-pass`). Then point a worktree at local and start the
+app the way you normally do:
 
-- **Synthetic test teams** (optional): `./avoca-dev seed` adds English/Spanish agents on the same team
-  for transfer-linking-style tests.
-- **Lookup dropdowns** (voices/llm_models): staging has none — `SOURCE_DB=production ./avoca-dev reference`
-  fills them from prod (a small, hardened read) if you need working dropdowns.
+```sh
+avoca-dev db setdev <worktree>
+cd <worktree> && pnpm dev
+```
+
+- **Synthetic test teams** (optional): `avoca-dev seed` adds English/Spanish agents for transfer tests.
+- **Lookup dropdowns / feature flags** already came from prod during setup — nothing extra to do.
 
 ## Configuration — point it at your checkout
 

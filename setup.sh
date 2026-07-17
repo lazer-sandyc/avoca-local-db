@@ -24,10 +24,25 @@ for c in docker supabase psql pg_dump; do
 done
 
 say "2/4  config"
-if [ -f config.sh ]; then ok "config.sh present"
-else cp config.example.sh config.sh; ok "created config.sh from the example (edit paths if your layout differs)"; fi
+if [ ! -f config.sh ]; then
+  cp config.example.sh config.sh
+  cat >&2 <<'EOF'
+  Created config.sh — your per-machine settings (gitignored, safe to edit).
+
+  ► Open config.sh and set your paths, then re-run ./setup.sh:
+      AVOCA_NEXT_DIR  — the absolute path to your avoca-next clone
+      WORKTREES_DIR   — where your avoca-next worktrees live
+    (Everything else has a sensible default; the local stack lives in THIS repo.)
+EOF
+  exit 0
+fi
+ok "config.sh present"
 # shellcheck disable=SC1091
 . ./config.sh 2>/dev/null || true
+: "${AVOCA_NEXT_DIR:=$HOME/code/avoca-next}"
+[ -d "$AVOCA_NEXT_DIR/packages/db/migrations" ] \
+  || die "AVOCA_NEXT_DIR ($AVOCA_NEXT_DIR) isn't an avoca-next clone (no packages/db/migrations) — set it in config.sh and re-run"
+ok "avoca-next: $AVOCA_NEXT_DIR"
 
 say "3/4  staging credentials"
 CREDS="${AVOCA_CREDS_FILE:-$HOME/.avoca/postgres.env}"
