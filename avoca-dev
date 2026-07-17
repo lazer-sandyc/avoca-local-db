@@ -616,7 +616,41 @@ cmd_db() {
       echo "$END_MARK"; } >> "$dash"
   fi
   log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322)"
+  _enable_local_cron_capability "$wt"
   echo "  restart any running dev server to apply (or use 'avoca-dev up')."
+}
+
+# Give a worktree the ability to run production crons locally, without a commit.
+#
+# The gate that decides "should this cron run" is committed avoca-next code that,
+# by default, only says yes on prod. Until the upstream PR lands, we patch that
+# gate locally so it also honours an `INNGEST_LOCAL_ENABLED_CRONS` allowlist in
+# .env.local (running the listed crons ONLY when pointed at a local DB). The file
+# is skip-worktree'd, so it never shows as a change and never enters a PR.
+#
+# Self-deactivating: once the capability is in avoca-next natively (PR merged),
+# the file already mentions the allowlist and this is a no-op. Delete the call
+# then. Never fatal — a patch that won't apply just warns.
+_enable_local_cron_capability() {
+  local wt="$1"
+  local rel="apps/web/utils/productionEnvironmentCheck.ts"
+  local file="$wt/$rel"
+  local patch; patch="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches/local-cron-enablement.patch"
+
+  [ -f "$file" ] || return 0
+  if grep -q 'INNGEST_LOCAL_ENABLED_CRONS' "$file"; then
+    return 0  # already present (patched before, or merged upstream) — nothing to do
+  fi
+  [ -f "$patch" ] || { echo "  (skipped local-cron capability: patch not found)"; return 0; }
+
+  if git -C "$wt" apply --check "$patch" >/dev/null 2>&1; then
+    git -C "$wt" apply "$patch"
+    git -C "$wt" update-index --skip-worktree "$rel"
+    echo "  ✓ local-cron capability enabled (skip-worktree'd, uncommitted)"
+    echo "    add ids to INNGEST_LOCAL_ENABLED_CRONS in apps/web/.env.local, then restart"
+  else
+    echo "  (skipped local-cron capability: patch no longer applies — upstream changed $rel)"
+  fi
 }
 
 # ── up: seamless local dev in one shot ────────────────────────────────────
