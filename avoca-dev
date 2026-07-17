@@ -12,6 +12,7 @@
 #   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from the source
 #   avoca-dev duplicate-team <id>   # copy a team's CONFIG from the source (no calls/PII; provider handles scrubbed)
 #   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
+#   avoca-dev db up|down|cycle      # start / stop / restart the local Supabase stack (handles the -x excludes)
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
 #   avoca-dev db setprod [worktree] # revert it to the PROD db
 #   avoca-dev db status  [worktree] # show which db each app is on
@@ -313,6 +314,7 @@ delete from public.transfer_destinations           where team_id=$team;
 delete from public.assistant_config_versions       where config_id in (select id from public.assistant_configs where team_id=$team);
 delete from public.assistant_configs               where team_id=$team;
 delete from public.voice_assistants                where team_id=$team;
+delete from public.responder_webhook_configs       where team_id=$team;
 delete from public.phone_numbers                   where team_id=$team;
 delete from public.teams                           where id=$team;
 SQL
@@ -367,6 +369,7 @@ cmd_duplicate_team() {
   _pull "$url" assistant_config_versions       "config_id in (select id from public.assistant_configs where team_id=$team)"
   _pull "$url" transfer_destinations           "team_id=$team"
   _pull "$url" transfer_destination_assistants "team_id=$team"
+  _pull "$url" responder_webhook_configs       "team_id=$team"
   _pull "$url" assistant_variables             "team_id=$team"
   _pull "$url" assistant_variables_versions    "team_id=$team"
 
@@ -559,8 +562,23 @@ strip_block() {
   awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last]==""){last--}; for(i=1;i<=last;i++) print a[i]}' "$f.adv2" > "$f"
   rm -f "$f.adv1" "$f.adv2"
 }
+# Bring the local Supabase stack up (excluding the flaky/unneeded containers), down, or cycle it.
+_stack_up() {
+  need supabase
+  log "starting local stack${SUPABASE_EXCLUDE:+ (excluding $SUPABASE_EXCLUDE)}"
+  local out rc=0
+  out="$( cd "$LOCAL_DB_DIR" && supabase start ${SUPABASE_EXCLUDE:+-x "$SUPABASE_EXCLUDE"} 2>&1 )" || rc=$?
+  printf '%s\n' "$out" | grep -viE '"[A-Z0-9_]+":|^\s*[{}]|Skipped|Image is already|A new version|We recommend|S3_PROTOCOL|STORAGE_S3' | tail -6 | sed 's/^/  /'
+  return $rc
+}
 cmd_db() {
-  local action="${1:?usage: avoca-dev db <setdev|setprod|status> [worktree]}"; local wt; wt="$(resolve_worktree "${2:-}")"
+  local action="${1:?usage: avoca-dev db <up|down|cycle|setdev|setprod|status> [worktree]}"
+  case "$action" in
+    up)    _stack_up; return ;;
+    down)  need supabase; log "stopping local stack (data kept; pass --no-backup to wipe)"; ( cd "$LOCAL_DB_DIR" && supabase stop "${@:2}" ) | tail -3 | sed 's/^/  /'; return ;;
+    cycle) need supabase; log "cycling local stack"; ( cd "$LOCAL_DB_DIR" && supabase stop >/dev/null 2>&1 || true ); _stack_up; return ;;
+  esac
+  local wt; wt="$(resolve_worktree "${2:-}")"
   local web="$wt/apps/web/.env.local" dash="$wt/apps/dashboard/.env.local"
   local env; env="$(sb_env)"; LOCAL_API="$(sbval "$env" API_URL)"; LOCAL_API="${LOCAL_API:-http://127.0.0.1:54321}"
 
