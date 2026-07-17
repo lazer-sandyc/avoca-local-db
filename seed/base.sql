@@ -52,14 +52,10 @@ BEGIN
   DELETE FROM phone_numbers         WHERE team_id BETWEEN 990001 AND 990099;
   DELETE FROM voice_assistants      WHERE team_id BETWEEN 990001 AND 990099;
   DELETE FROM teams                 WHERE id      BETWEEN 990001 AND 990099;
-  DELETE FROM enterprises           WHERE id = v_ent_id;
-  DELETE FROM profiles              WHERE id = v_owner_id;
-  DELETE FROM auth.users            WHERE id = v_owner_id;
-
-  -- ---- enterprise + synthetic owner (teams.owner_id -> profiles.id -> auth.users.id) ----
-  INSERT INTO enterprises (id, name) VALUES (v_ent_id, 'Lazer Test Enterprise');
-  INSERT INTO auth.users (id) VALUES (v_owner_id);
-  INSERT INTO profiles (id, email) VALUES (v_owner_id, 'test-owner@lazer.local');
+  -- NOTE: the synthetic owner (v_owner_id) + enterprise (v_ent_id) are created by
+  -- avoca-dev's _ensure_synthetic_owner (run by setup AND seed), NOT here. This keeps
+  -- them out of the generic setup's team list, and means re-seeding never deletes an
+  -- owner a duplicated real team is attached to. This block assumes they already exist.
 
   -- ---- teams, each with an English + Spanish agent ----
   FOR t IN 1..v_n_teams LOOP

@@ -37,7 +37,8 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${WORKTREES_DIR:=$HOME/code/lazer/avoca/avoca-next.worktrees}"        # where worktrees live
 : "${LOCAL_DB_DIR:=$HOME/code/lazer/avoca/avoca-local-db}"              # supabase-local home
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"                      # schemas to mirror
-: "${REFERENCE_TABLES:=voices,llm_models,transcribers}"                  # global lookup data the app needs (no PII); copied data-only from prod
+: "${REFERENCE_TABLES:=}"                                                # EXTRA global tables to sync beyond SYNC_CORE (per-machine additions)
+: "${REFERENCE_SOURCE:=production}"                                      # global config is prod-accurate (staging is sparse) — always sync from prod
 : "${PROD_PROJECT_REF:=wmizcewjcybhvkpwpmim}"                            # prod supabase ref
 : "${PROD_ENV_FILE:=$AVOCA_NEXT_DIR/apps/web/.env.local}"               # legacy fallback source of the PROD db url
 : "${AVOCA_CREDS_FILE:=$HOME/.avoca/postgres.env}"                       # Avoca's personal creds: STAGING_POSTGRES_URL + PROD_POSTGRES_URL
@@ -50,6 +51,11 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # never copy real owner PII (auth.users/profiles). Must match seed/base.sql.
 : "${SEED_OWNER_ID:=b0000000-0000-0000-0000-000000000001}"
 : "${SEED_ENTERPRISE_ID:=990000}"
+
+# Global config tables synced from prod so a local matches what people expect from
+# production (staging is sparse on these). THE LIST GROWS — add a table here whenever a
+# prod-only global setting bites you locally (feature flags were the first beyond lookups).
+SYNC_CORE="voices,llm_models,transcribers,feature_flags"
 
 die() { echo "avoca-dev: $*" >&2; exit 1; }
 log() { echo "▸ $*"; }
@@ -140,14 +146,11 @@ SQL
 
   cmd_grants
   cmd_ledger
-  # Reference lookups (voices/llm_models/…): prod has them, staging is sparse. The staging
-  # snapshot already brought whatever staging had; only auto-pull from prod when mirroring prod.
-  case "$SOURCE_DB" in
-    production|prod) cmd_reference ;;
-    *) log "reference tables came from the $SOURCE_DB snapshot (staging is sparse — 'SOURCE_DB=production avoca-dev reference' fills voices/llm_models/… from prod if you need them)" ;;
-  esac
-  _seed_login   # so you can log in immediately (synthetic test teams are the separate 'seed' step)
-  log "setup done. You can log in now. Next: avoca-dev up <worktree>   (optional: avoca-dev seed for synthetic test teams)"
+  cmd_reference             # sync global prod config (lookups + feature flags) so local matches production
+  _ensure_synthetic_owner   # synthetic owner/enterprise so duplicate-team works out of the box (NOT the Test Auto teams)
+  _seed_login               # local login user
+  log "setup done. Log in as $LOGIN_EMAIL, and clone a real team: SOURCE_DB=production avoca-dev duplicate-team <id>"
+  log "  run your app: avoca-dev db setdev <worktree> then your normal pnpm dev.  (synthetic transfer test teams: avoca-dev seed)"
 }
 
 # Reference / lookup data the app genuinely needs to function (voice list, LLM
@@ -223,14 +226,20 @@ _src_pgdump() {
 
 cmd_reference() {
   need psql; need pg_dump
-  local src_url; src_url="$(_source_url)"
-  IFS=',' read -ra RTABLES <<< "$REFERENCE_TABLES"
-  log "load reference data from $SOURCE_DB (READ-ONLY): $REFERENCE_TABLES"
+  local src_url; src_url="$(SOURCE_DB="$REFERENCE_SOURCE" _source_url)"   # always prod: staging is sparse on global config
+  # tool-owned SYNC_CORE (grows over time) + optional per-machine REFERENCE_TABLES extras, deduped
+  local tables; tables="$(echo "$SYNC_CORE,${REFERENCE_TABLES:-}" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)"
+  IFS=',' read -ra RTABLES <<< "$tables"
+  log "sync global config from $REFERENCE_SOURCE (READ-ONLY, prod-parity): $tables"
   for t in "${RTABLES[@]}"; do
     [ -n "$t" ] || continue
-    _src_pgdump "$src_url" --data-only --inserts --on-conflict-do-nothing --no-owner --no-privileges --table="public.$t" 2>/dev/null \
+    # REPLACE local rows with prod's (a clean mirror — matters for tables like feature_flags
+    # whose serial-id PK would make an additive copy silently skip rows). Under replica role
+    # (FK triggers off) so delete + reload never blocks on order or cross-references.
+    printf 'SET session_replication_role=replica;\nDELETE FROM public.%s;\n' "$t" | lsql -q >/dev/null 2>&1 || true
+    { printf 'SET session_replication_role=replica;\n'; _src_pgdump "$src_url" --data-only --no-owner --no-privileges --table="public.$t" 2>/dev/null; } \
       | lsql -q -v ON_ERROR_STOP=0 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -5 || true
-    local n; n="$(lsql -tAc "select count(*) from $t" 2>/dev/null || echo '?')"
+    local n; n="$(lsql -tAc "select count(*) from public.$t" 2>/dev/null || echo '?')"
     log "  $t: $n rows"
   done
 }
@@ -346,8 +355,7 @@ cmd_duplicate_team() {
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
   [ -n "$name" ] || die "no team $team in prod"
-  local ok; ok="$(lsql -tAc "select (exists(select 1 from profiles where id='$SEED_OWNER_ID') and exists(select 1 from enterprises where id=$SEED_ENTERPRISE_ID))::text" 2>/dev/null)"
-  [ "$ok" = true ] || die "run 'avoca-dev seed' first — need the synthetic owner + enterprise to attach the copied team to"
+  _ensure_synthetic_owner   # create the synthetic owner/enterprise if missing (no 'seed' prereq)
   log "duplicate team $team ('$name') from $SOURCE_DB (READ-ONLY; config only; provider handles scrubbed)"
 
   _purge_team_local "$team"   # drop any prior copy so re-runs are idempotent
@@ -454,6 +462,19 @@ cmd_reset() {
   cmd_setup
 }
 
+# Create the synthetic owner + enterprise if missing. duplicate-team re-attaches copied
+# teams to these so no real owner PII lands locally. Created on demand by `setup` (so
+# duplicate-team works out of the box) — you do NOT need the full `seed` (Test Auto teams)
+# just to clone a real team. Idempotent.
+_ensure_synthetic_owner() {
+  need psql
+  lsql -q >/dev/null 2>&1 <<SQL || true
+INSERT INTO enterprises (id, name) VALUES ($SEED_ENTERPRISE_ID, 'Lazer Test Enterprise') ON CONFLICT (id) DO NOTHING;
+INSERT INTO auth.users (id) VALUES ('$SEED_OWNER_ID') ON CONFLICT (id) DO NOTHING;
+INSERT INTO profiles (id, email) VALUES ('$SEED_OWNER_ID', 'test-owner@lazer.local') ON CONFLICT (id) DO NOTHING;
+SQL
+}
+
 # Create a LOCAL login user (auth.users + identity + profile) so you can sign in.
 # Independent of staging/prod auth — we never copy those. Idempotent. Run by both
 # `setup` (so login works out of the box) and `seed`.
@@ -463,10 +484,11 @@ _seed_login() {
   lsql -q -v email="$LOGIN_EMAIL" -v pass="$LOGIN_PASSWORD" -v fullname="$LOGIN_NAME" -f "$SELF_DIR/seed/login-user.sql" 2>&1 | grep -iE 'error|confirmed|bcrypt|identity|profile' | head -10 || true
 }
 
-# ── seed: synthetic test fixtures (login user comes from setup) ────────────
+# ── seed: OPTIONAL synthetic Test Auto teams (owner + login come from setup) ─
 cmd_seed() {
   need psql
-  log "load synthetic fixtures (enterprise + teams + agents + transfer destinations)"
+  _ensure_synthetic_owner   # base.sql attaches the Test Auto teams to this
+  log "load synthetic Test Auto teams (English/Spanish agents + transfer destinations)"
   lsql -q -f "$SELF_DIR/seed/base.sql" 2>&1 | grep -iE 'error|^ *[a-z].*\| *[0-9]' | head -20 || true
   _seed_login
   # Twilio subaccounts are NOT provisioned here — do it on demand from the app UI,

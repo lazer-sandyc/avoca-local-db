@@ -17,9 +17,12 @@
 # Schemas mirrored/snapshotted from the source (comma-separated).
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"
 
-# Global lookup/reference tables (voice list, LLM models, transcribers, …). Staging
-# has these empty; `SOURCE_DB=production avoca-dev reference` fills them from prod.
-: "${REFERENCE_TABLES:=voices,llm_models,transcribers}"
+# Global config synced from prod so local matches production (voices, llm_models,
+# transcribers, feature_flags, …). The core list lives in avoca-dev (`SYNC_CORE`) and
+# GROWS there as prod-only settings bite us. REFERENCE_TABLES adds per-machine EXTRAS
+# on top; REFERENCE_SOURCE is where to pull them from (prod — staging is sparse on these).
+: "${REFERENCE_TABLES:=}"
+: "${REFERENCE_SOURCE:=production}"
 
 # Prod Supabase project ref — used to detect a prod URL baked into a stale .next
 # bundle (the compile-time NEXT_PUBLIC split-brain).
