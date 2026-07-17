@@ -544,9 +544,16 @@ BEGIN_MARK="# >>> avoca-dev managed: LOCAL db overrides (do not edit) >>>"
 END_MARK="# <<< avoca-dev managed <<<"
 strip_block() {
   local f="$1"; [ -f "$f" ] || return 0
-  awk -v b="$BEGIN_MARK" '
-    index($0,b)==1 || index($0,"# --- shared local DB")==1 || index($0,"# >>> point-db managed")==1 { stop=1 }
-    stop { next } { print }
+  # Current format is a bounded block (BEGIN..END inclusive) — drop it but KEEP
+  # anything after it (e.g. the INNGEST_LOCAL_ENABLED_CRONS line that `cron` writes).
+  # Legacy formats had no END marker, so those are still stripped to EOF.
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    index($0,b)==1 { inblk=1; next }
+    inblk && index($0,e)==1 { inblk=0; next }
+    inblk { next }
+    index($0,"# --- shared local DB")==1 || index($0,"# >>> point-db managed")==1 { legacy=1 }
+    legacy { next }
+    { print }
   ' "$f" > "$f.adv1"
   # DB-only: strip the managed DB overrides. App-URL vars (WEB_APP_URL,
   # NEXT_PUBLIC_WEB_APP_URL, NEXT_PUBLIC_DASHBOARD_URL) are NOT touched here —
@@ -563,6 +570,26 @@ strip_block() {
   awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last]==""){last--}; for(i=1;i<=last;i++) print a[i]}' "$f.adv2" > "$f"
   rm -f "$f.adv1" "$f.adv2"
 }
+# In DEV mode the managed block re-defines keys that ALSO have live originals in the
+# Vercel-pulled env (NEXT_PUBLIC_SUPABASE_URL/ANON_KEY, WEB_APP_URL, ...). Those are
+# read by two different layers — server (last-wins, fine) and the browser bundle
+# (NEXT_PUBLIC_* inlined at build time) — so a live original can leave the browser
+# pointed at the REMOTE db while the server is on local (split-brain). We comment the
+# originals out with a reversible tag so the managed block is the only definition;
+# setprod strips the tag and the file round-trips byte-for-byte back to prod.
+OFF_TAG="#avoca-dev-off# "
+_disable_dupes() { # $1=file, rest=keys to comment out
+  local f="$1"; shift; [ -f "$f" ] || return 0
+  local k
+  for k in "$@"; do perl -i -pe "s{^(${k}=)}{${OFF_TAG}\$1}" "$f"; done
+}
+_enable_dupes() { # $1=file — restore every tagged original
+  local f="$1"; [ -f "$f" ] || return 0
+  perl -i -pe "s{^\Q${OFF_TAG}\E}{}" "$f"
+}
+# NEXT_PUBLIC_* are baked into .next at build time, so a stale build keeps serving the
+# old db URL to the browser after a switch. Wipe it so the next `pnpm dev` rebuilds clean.
+_wipe_next() { local wt="$1"; rm -rf "$wt/apps/web/.next" "$wt/apps/dashboard/.next" 2>/dev/null || true; }
 # Bring the local Supabase stack up (excluding the flaky/unneeded containers), down, or cycle it.
 _stack_up() {
   need supabase
@@ -594,15 +621,22 @@ cmd_db() {
     done; return 0
   fi
 
+  # keys the managed block re-defines — must not stay live as originals in dev mode
+  local WEB_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD NEXT_PUBLIC_DASHBOARD_URL"
+  local DASH_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_URL WEB_APP_URL NEXT_PUBLIC_WEB_APP_URL"
+
   strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
   if [ "$action" = setprod ] || [ "$action" = prod ]; then
-    log "$(basename "$wt") → PROD (stripped local overrides; reverts to Vercel-pulled values)"
+    _enable_dupes "$web"; [ -f "$dash" ] && _enable_dupes "$dash"
+    _wipe_next "$wt"
+    log "$(basename "$wt") → PROD (restored originals; reverts to Vercel-pulled values; .next wiped)"
     echo "  restart any running dev server to apply."; return 0
   fi
   [ "$action" = setdev ] || [ "$action" = dev ] || [ "$action" = local ] || die "action must be setdev, setprod, or status"
 
   local anon svc; anon="$(sbval "$env" ANON_KEY)"; svc="$(sbval "$env" SERVICE_ROLE_KEY)"
   [ -n "$anon" ] && [ -n "$svc" ] || die "couldn't read local Supabase keys — is the stack up? (avoca-dev setup)"
+  _disable_dupes "$web" $WEB_DUP_KEYS
   { echo ""; echo "$BEGIN_MARK"
     echo "POSTGRES_HOST=127.0.0.1"; echo "POSTGRES_PORT=54322"; echo "POSTGRES_DB=postgres"
     echo "POSTGRES_USER=postgres"; echo "POSTGRES_PASSWORD=postgres"
@@ -610,13 +644,15 @@ cmd_db() {
     echo "SUPABASE_SECRET_KEY=$svc"; echo "NEXT_PUBLIC_DASHBOARD_URL=http://localhost:3002"
     echo "$END_MARK"; } >> "$web"
   if [ -f "$dash" ]; then
+    _disable_dupes "$dash" $DASH_DUP_KEYS
     { echo ""; echo "$BEGIN_MARK"
       echo "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API"; echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
       echo "SUPABASE_SECRET_KEY=$svc"; echo "POSTGRES_URL=$LOCAL_PG_URL"
       echo "WEB_APP_URL=http://localhost:3000"; echo "NEXT_PUBLIC_WEB_APP_URL=http://localhost:3000"
       echo "$END_MARK"; } >> "$dash"
   fi
-  log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322)"
+  _wipe_next "$wt"
+  log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322; .next wiped)"
   _enable_local_cron_capability "$wt"
   echo "  restart any running dev server to apply (or use 'avoca-dev up')."
 }
