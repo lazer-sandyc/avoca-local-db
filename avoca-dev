@@ -36,7 +36,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SELF_DIR/config.sh" ] && . "$SELF_DIR/config.sh"
 : "${AVOCA_NEXT_DIR:=$HOME/code/lazer/avoca/avoca-next}"                 # canonical clone
 : "${WORKTREES_DIR:=$HOME/code/lazer/avoca/avoca-next.worktrees}"        # where worktrees live
-: "${LOCAL_DB_DIR:=$HOME/code/lazer/avoca/avoca-local-db}"              # supabase-local home
+: "${LOCAL_DB_DIR:=$SELF_DIR}"              # supabase-local home
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"                      # schemas to mirror
 : "${REFERENCE_TABLES:=}"                                                # EXTRA global tables to sync beyond SYNC_CORE (per-machine additions)
 : "${REFERENCE_SOURCE:=production}"                                      # global config is prod-accurate (staging is sparse) — always sync from prod
@@ -45,8 +45,8 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AVOCA_CREDS_FILE:=$HOME/.avoca/postgres.env}"                       # Avoca's personal creds: STAGING_POSTGRES_URL + PROD_POSTGRES_URL
 : "${SOURCE_DB:=staging}"                                                # upstream avoca-dev READS from: staging (default) | production
 : "${SUPABASE_EXCLUDE:=logflare,vector}"                                 # containers to skip on 'supabase start' (analytics stack is flaky + unneeded for dev)
-: "${LOGIN_EMAIL:=dev@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
-: "${LOGIN_PASSWORD:=avoca-password}"
+: "${LOGIN_EMAIL:=avoca-user@avoca.ai}"                                        # seeded password login (@avoca.ai => admin)
+: "${LOGIN_PASSWORD:=avoca-pass}"
 : "${LOGIN_NAME:=Local Dev}"
 # Synthetic owner + enterprise a duplicated prod team is re-attached to, so we
 # never copy real owner PII (auth.users/profiles). Must match seed/base.sql.

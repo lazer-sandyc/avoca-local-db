@@ -4,15 +4,18 @@
 # env override > config.sh > default — e.g. `SOURCE_DB=production avoca-dev …`
 # wins over the SOURCE_DB set here. config.sh is gitignored (per-machine).
 
-# Your canonical avoca-next clone. Used to read the migration files + seed the
-# umzug ledger from origin/main.
-: "${AVOCA_NEXT_DIR:=$HOME/code/lazer/avoca/avoca-next}"
+# ── Paths: SET THESE to your machine. The values below are only examples — there is no
+#    standard location, so point them at wherever YOUR repos actually live. ──
 
-# Where your avoca-next worktrees live (the tool resolves a <slug> under here).
-: "${WORKTREES_DIR:=$HOME/code/lazer/avoca/avoca-next.worktrees}"
+# Your avoca-next clone. avoca-dev reads its origin/main to seed the migration ledger.
+: "${AVOCA_NEXT_DIR:=$HOME/code/avoca-next}"
 
-# Where the local Supabase stack is kept (a dedicated, stable dir).
-: "${LOCAL_DB_DIR:=$HOME/code/lazer/avoca/avoca-local-db}"
+# Where your avoca-next worktrees live (avoca-dev resolves a <slug> under here).
+: "${WORKTREES_DIR:=$HOME/code/avoca-next.worktrees}"
+
+# The local Supabase stack lives in THIS repo by default (LOCAL_DB_DIR = the avoca-local-db
+# dir). No need to set it — uncomment only to keep the stack somewhere else:
+# : "${LOCAL_DB_DIR:=$HOME/some/other/dir}"
 
 # Schemas mirrored/snapshotted from the source (comma-separated).
 : "${APP_SCHEMAS:=public,crm_service_titan,twilio}"
@@ -55,6 +58,6 @@
 
 # Seeded password login (an @avoca.ai address gets system admin). With Google OAuth
 # wired (avoca-dev oauth) you can ignore this and just sign in with Google.
-: "${LOGIN_EMAIL:=dev@avoca.ai}"
-: "${LOGIN_PASSWORD:=avoca-password}"
+: "${LOGIN_EMAIL:=avoca-user@avoca.ai}"
+: "${LOGIN_PASSWORD:=avoca-pass}"
 : "${LOGIN_NAME:=Local Dev}"
