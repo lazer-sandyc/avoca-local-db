@@ -11,6 +11,8 @@
 #   avoca-dev seed                  # load synthetic test teams (English/Spanish agents for transfer tests)
 #   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from the source
 #   avoca-dev duplicate-team <id>   # copy a team's CONFIG from the source (no calls/PII; provider handles scrubbed)
+#   avoca-dev duplicate-team <id> --with-calls[=N]  # ...and also import its newest N real calls (default 50)
+#   avoca-dev dup-calls      <id> [--since <days> | --limit <n>]  # import a bounded slice of a team's real call history
 #   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
 #   avoca-dev db up|down|cycle      # start / stop / restart the local Supabase stack (handles the -x excludes)
 #   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
@@ -264,8 +266,16 @@ _cols() {
 # Runs under replica role; caller is responsible for clearing stale rows first.
 _pull() {
   local url="$1" tbl="$2" where="$3"
-  local cols; cols="$(_cols "$tbl")"
-  [ -n "$cols" ] || die "unknown table: $tbl"
+  # Copy only columns present in BOTH source and local. Local can carry un-merged
+  # migration columns the source lacks (e.g. a not-yet-deployed feature column) — and
+  # selecting those from the source errors. The intersection avoids that; COPY column
+  # order is irrelevant as long as SELECT and COPY use the same list (they do).
+  local srccols localcols cols
+  srccols="$(_src_psql "$url" -tAqc "select column_name from information_schema.columns where table_schema='public' and table_name='$tbl' and is_generated='NEVER'" 2>/dev/null)"
+  [ -n "$srccols" ] || die "unknown/empty table in $SOURCE_DB: $tbl"
+  localcols="$(lsql -tAqc "select column_name from information_schema.columns where table_schema='public' and table_name='$tbl' and is_generated='NEVER'" 2>/dev/null)"
+  cols="$(comm -12 <(printf '%s\n' "$srccols" | sort -u) <(printf '%s\n' "$localcols" | sort -u) | grep . | sed 's/.*/"&"/' | paste -sd, - 2>/dev/null || true)"
+  [ -n "$cols" ] || die "no shared columns for $tbl between $SOURCE_DB and local"
   local tmp; tmp="$(mktemp -t avoca-pull.XXXX)"
   _src_psql "$url" -qX -c "\copy (select $cols from public.$tbl where $where) to '$tmp'" >/dev/null 2>"$tmp.err" \
     || { cat "$tmp.err" >&2; rm -f "$tmp" "$tmp.err"; die "prod read failed for $tbl"; }
@@ -353,7 +363,15 @@ cmd_delete_team() {
 # the synthetic seed owner/enterprise so no owner PII is copied. Referenced
 # modular blueprints are auto-pulled. Idempotent (drops any prior copy first).
 cmd_duplicate_team() {
-  local team="${1:?usage: avoca-dev duplicate-team <team_id>}"
+  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--with-calls[=N]]}"; shift || true
+  local with_calls=""   # empty = config only; else newest-N real calls to also import
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-calls)   with_calls=50; shift;;
+      --with-calls=*) with_calls="${1#*=}"; shift;;
+      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--with-calls[=N]])";;
+    esac
+  done
   need psql
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
@@ -425,6 +443,71 @@ SQL
   # If you do need to test calls on this team: 'avoca-dev twilio provision $team'
   # then buy a test number in the UI.
   log "done — team $team ('$name') is in local (config only; numbers dropped; provider handles scrubbed; owner→synthetic)."
+  [ -n "$with_calls" ] && cmd_dup_calls "$team" --limit "$with_calls"
+}
+
+# dup-calls <team_id> [--since <days> | --limit <n>]: copy a BOUNDED slice of a team's
+# real call history (calls + call_flows + transcripts/analysis + transfer notes) from the
+# source into local, so the calls page has data and the reconciliation/linking path has
+# rows to inspect. duplicate-team stays PII-free; THIS is the opt-in that knowingly brings
+# real call content (transcripts, phone numbers) onto your LOCAL machine only. Recording
+# AUDIO is NOT copied (Storage isn't mirrored), so stitch has no media to assemble.
+# Idempotent: replaces this team's imported call rows each run. Default: newest 50 calls.
+# Calls live in prod, so run: SOURCE_DB=production avoca-dev dup-calls <id>
+cmd_dup_calls() {
+  local team="${1:?usage: avoca-dev dup-calls <team_id> [--since <days> | --limit <n>]}"; shift || true
+  need psql
+  local since_days="" limit_n=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since)   since_days="${2:?--since needs a number of days}"; shift 2;;
+      --since=*) since_days="${1#*=}"; shift;;
+      --limit)   limit_n="${2:?--limit needs a number}"; shift 2;;
+      --limit=*) limit_n="${1#*=}"; shift;;
+      *) die "unknown arg: $1 (usage: dup-calls <team_id> [--since <days> | --limit <n>])";;
+    esac
+  done
+  [ -n "$since_days" ] && [ -n "$limit_n" ] && die "use --since OR --limit, not both"
+  [ -n "$since_days$limit_n" ] || limit_n=50   # default: newest 50 calls
+  case "$since_days$limit_n" in *[!0-9]*) die "--since/--limit take a plain number";; esac
+
+  local url; url="$(_source_url)"
+  local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  [ -n "$name" ] || die "no team $team in $SOURCE_DB (calls live in prod — try SOURCE_DB=production)"
+  [ -n "$(lsql -tAc "select 1 from teams where id=$team" 2>/dev/null)" ] \
+    || die "team $team isn't in local yet — run 'SOURCE_DB=$SOURCE_DB avoca-dev duplicate-team $team' first (calls FK to teams)"
+
+  # source-side selector for THIS team's calls, bounded by window or count
+  local sel
+  if [ -n "$limit_n" ]; then
+    sel="team_id=$team and id in (select id from public.calls where team_id=$team order by created_at desc nulls last limit $limit_n)"
+    log "dup-calls team $team ('$name') from $SOURCE_DB — newest $limit_n calls (READ-ONLY)"
+  else
+    sel="team_id=$team and created_at >= now() - interval '$since_days days'"
+    log "dup-calls team $team ('$name') from $SOURCE_DB — last $since_days days (READ-ONLY)"
+  fi
+  local callsub="select id from public.calls where $sel"
+
+  # idempotent: clear this team's previously-imported call rows (children first; replica => order-free)
+  lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+delete from public.transfer_destination_logs where source_call_id in (select id from public.calls where team_id=$team) or received_call_id in (select id from public.calls where team_id=$team);
+delete from public.call_conversations where call_id in (select id from public.calls where team_id=$team);
+delete from public.call_analysis      where call_id in (select id from public.calls where team_id=$team);
+delete from public.calls              where team_id=$team;
+delete from public.call_flows         where team_id=$team;
+SQL
+
+  # parents first (logging only; replica role makes FK order irrelevant)
+  _pull "$url" call_flows "team_id=$team and id in (select call_flow_id from public.calls where $sel and call_flow_id is not null)"
+  _pull "$url" calls                     "$sel"
+  _pull "$url" call_conversations        "call_id in ($callsub)"
+  _pull "$url" call_analysis             "call_id in ($callsub)"
+  _pull "$url" transfer_destination_logs "source_call_id in ($callsub) or received_call_id in ($callsub)"
+
+  local n; n="$(lsql -tAc "select count(*) from calls where team_id=$team" | tr -d ' ')"
+  log "done — $n calls in local for team $team."
+  echo "  PII: transcripts/analysis are REAL call content (LOCAL only, never shared). Recording audio is NOT mirrored, so stitch has no media."
 }
 
 # Supabase role grants (pg_dump --no-privileges strips these; without them the
@@ -925,6 +1008,7 @@ case "${1:-}" in
   reference) shift; cmd_reference "$@";;
   duplicate-bp)   shift; cmd_duplicate_bp "$@";;
   duplicate-team) shift; cmd_duplicate_team "$@";;
+  dup-calls)      shift; cmd_dup_calls "$@";;
   delete-team)    shift; cmd_delete_team "$@";;
   reset)   shift; cmd_reset "$@";;
   grants)  shift; cmd_grants "$@";;
