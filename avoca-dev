@@ -318,6 +318,8 @@ _purge_team_local() {
   local team="$1"
   lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
+delete from public.system_prompt_config_versions  where team_id=$team;
+delete from public.system_prompt_configs           where team_id=$team;
 delete from public.knowledge_bases                 where team_id=$team;
 delete from public.team_call_reasons               where team_id=$team;
 delete from public.team_transfer_reasons           where team_id=$team;
@@ -400,10 +402,18 @@ cmd_duplicate_team() {
   _pull "$url" assistant_config_versions       "config_id in (select id from public.assistant_configs where team_id=$team)"
   _pull "$url" transfer_destinations           "team_id=$team"
   _pull "$url" transfer_destination_assistants "team_id=$team"
-  # Prompt inputs + reasons: the KB feeds the compiled agent prompt (service info,
-  # hours, FAQs) — without it a cloned team's calls fail. team_transfer_reasons
-  # backs transfer_destinations.transfer_reason_ids; team_call_reasons backs
-  # bookability/call-reason tagging. All per-team rows keyed by team_id.
+  # Prompt inputs + reasons. system_prompt_configs IS the live "Knowledge Base"
+  # (company_name, timezone, business_hours, company_location/phone/email, fees) —
+  # it compiles straight into the agent prompt, so without it a cloned team has no
+  # timezone/business-hours/company context and its blueprint fails. Its _versions
+  # carry the history. team_transfer_reasons backs
+  # transfer_destinations.transfer_reason_ids; team_call_reasons backs
+  # bookability/call-reason tagging. knowledge_bases is the legacy KB table (empty
+  # for modern teams, kept for older ones). All per-team, keyed by team_id.
+  # NOTE: these live in PRODUCTION — run with SOURCE_DB=production or they come
+  # back empty (staging teams carry no KB).
+  _pull "$url" system_prompt_configs           "team_id=$team"
+  _pull "$url" system_prompt_config_versions   "team_id=$team"
   _pull "$url" knowledge_bases                 "team_id=$team"
   _pull "$url" team_call_reasons               "team_id=$team"
   _pull "$url" team_transfer_reasons           "team_id=$team"
