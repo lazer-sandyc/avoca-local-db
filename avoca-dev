@@ -27,6 +27,7 @@
 #   avoca-dev twilio deprovision [team]   # reclaim one, or (no arg) ALL local subaccounts — run this on plan/worktree close
 #   avoca-dev twilio status               # audit the subaccounts we provisioned
 #   avoca-dev status                # show the stack + db + worktree pointers
+#   avoca-dev clear [--keep-db]     # teardown: setprod every LOCAL worktree, then wipe + stop the stack
 #
 # Config: copy config.example.sh -> config.sh and edit, or override any var via env.
 
@@ -923,6 +924,42 @@ cmd_status() {
   [ "$found" = 1 ] || echo "    (no avoca-next worktrees found)"
 }
 
+# ── clear: tear the whole local-dev setup back down ───────────────────────
+# The inverse of standing it up. For every worktree currently pointed at the
+# LOCAL db (the main clone + each worktree), run `db setprod` so its env round-
+# trips back to the Vercel-pulled prod values. Then wipe the local db and stop
+# the Supabase stack, so the next `db up` (or `setup`) starts from clean.
+#   avoca-dev clear             # setprod every LOCAL worktree, then wipe + stop the stack
+#   avoca-dev clear --keep-db   # same, but keep the stack's data (just stop it)
+cmd_clear() {
+  local keepdb=0
+  case "${1:-}" in --keep-db|--keep) keepdb=1 ;; "" ) : ;; *) die "usage: avoca-dev clear [--keep-db]" ;; esac
+
+  # 1. Revert every worktree that's on LOCAL back to PROD (env round-trips).
+  local reverted=0 d
+  for d in "$AVOCA_NEXT_DIR" "$WORKTREES_DIR"/*/; do
+    [ -d "$d/apps/web" ] || continue
+    if [ "$(ptr_tag "$d/apps/web/.env.local")" = LOCAL ] \
+       || [ "$(ptr_tag "$d/apps/dashboard/.env.local")" = LOCAL ]; then
+      log "setprod $(basename "$d")"
+      cmd_db setprod "$d" >/dev/null
+      reverted=$((reverted + 1))
+    fi
+  done
+  if [ "$reverted" = 0 ]; then log "no worktrees were on LOCAL — nothing to revert"; else log "reverted $reverted worktree(s) → PROD"; fi
+
+  # 2. Stop the stack — wiping its data unless --keep-db.
+  need supabase
+  if [ "$keepdb" = 1 ]; then
+    log "stopping local stack (data kept)"
+    ( cd "$LOCAL_DB_DIR" && supabase stop ) | tail -3 | sed 's/^/  /'
+  else
+    log "wiping + stopping local stack (--no-backup)"
+    ( cd "$LOCAL_DB_DIR" && supabase stop --no-backup ) | tail -3 | sed 's/^/  /'
+  fi
+  log "cleared. to rebuild:  avoca-dev db up   (data kept)   ·   avoca-dev setup   (fresh snapshot)"
+}
+
 # ── dispatch ──────────────────────────────────────────────────────────────
 case "${1:-}" in
   setup)   shift; cmd_setup "$@";;
@@ -943,6 +980,7 @@ case "${1:-}" in
   trim)    shift; cmd_trim "$@";;
   twilio)  shift; cmd_twilio "$@";;
   status)  shift; cmd_status "$@";;
-  ""|-h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
+  clear)   shift; cmd_clear "$@";;
+  ""|-h|--help|help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$1' (try: avoca-dev help)";;
 esac
