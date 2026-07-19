@@ -20,7 +20,6 @@
 #   avoca-dev db status  [worktree] # show which db each app is on
 #   avoca-dev migrate [up|pending|executed] [wt]  # run unmerged migrations against LOCAL (the cheap loop)
 #   avoca-dev types      [worktree] # regen Supabase types from the LOCAL schema (not prod)
-#   avoca-dev cron ls|add <id>|rm <id> [wt]  # enable inngest crons locally (linking / stitch / …)
 #   avoca-dev up         [worktree] # seamless: point local + drop stale bundle + pnpm dev
 #   avoca-dev oauth <client-id> <secret>   # wire Google sign-in locally (needs a stack restart)
 #   avoca-dev trim                  # cut the Supabase stack to the ~7 containers we use
@@ -639,7 +638,7 @@ END_MARK="# <<< avoca-dev managed <<<"
 strip_block() {
   local f="$1"; [ -f "$f" ] || return 0
   # Current format is a bounded block (BEGIN..END inclusive) — drop it but KEEP
-  # anything after it (e.g. the INNGEST_LOCAL_ENABLED_CRONS line that `cron` writes).
+  # anything after it (hand-added env the developer put below the managed block).
   # Legacy formats had no END marker, so those are still stripped to EOF.
   awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
     index($0,b)==1 { inblk=1; next }
@@ -753,102 +752,7 @@ cmd_db() {
   fi
   _wipe_next "$wt"
   log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322; .next wiped)"
-  _enable_local_cron_capability "$wt"
   echo "  restart any running dev server to apply (or use 'avoca-dev up')."
-}
-
-# Give a worktree the ability to run production crons locally, without a commit.
-#
-# The gate that decides "should this cron run" is committed avoca-next code that,
-# by default, only says yes on prod. Until the upstream PR lands, we patch that
-# gate locally so it also honours an `INNGEST_LOCAL_ENABLED_CRONS` allowlist in
-# .env.local (running the listed crons ONLY when pointed at a local DB). The file
-# is skip-worktree'd, so it never shows as a change and never enters a PR.
-#
-# Self-deactivating: once the capability is in avoca-next natively (PR merged),
-# the file already mentions the allowlist and this is a no-op. Delete the call
-# then. Never fatal — a patch that won't apply just warns.
-_enable_local_cron_capability() {
-  local wt="$1"
-  local rel="apps/web/utils/productionEnvironmentCheck.ts"
-  local file="$wt/$rel"
-  local patch; patch="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches/local-cron-enablement.patch"
-
-  [ -f "$file" ] || return 0
-  if grep -q 'INNGEST_LOCAL_ENABLED_CRONS' "$file"; then
-    return 0  # already present (patched before, or merged upstream) — nothing to do
-  fi
-  [ -f "$patch" ] || { echo "  (skipped local-cron capability: patch not found)"; return 0; }
-
-  if git -C "$wt" apply --check "$patch" >/dev/null 2>&1; then
-    git -C "$wt" apply "$patch"
-    git -C "$wt" update-index --skip-worktree "$rel"
-    echo "  ✓ local-cron capability enabled (skip-worktree'd, uncommitted)"
-    echo "    add ids to INNGEST_LOCAL_ENABLED_CRONS in apps/web/.env.local, then restart"
-  else
-    echo "  (skipped local-cron capability: patch no longer applies — upstream changed $rel)"
-  fi
-}
-
-# ── cron: manage the local inngest cron allowlist (INNGEST_LOCAL_ENABLED_CRONS) ──
-# `db setdev` patches the app to honor this allowlist (above); these list/add/remove
-# the crons in it, per worktree. A cron runs locally ONLY when the capability is on
-# (db setdev) AND its id is in the allowlist. Restart the dev server after a change.
-#   avoca-dev cron ls  [wt]          # every cron in the codebase; ● = enabled locally
-#   avoca-dev cron add <id> [wt]     # enable a cron locally  (e.g. incremental-source-poller-scheduler = call linking)
-#   avoca-dev cron rm  <id> [wt]     # disable it
-cmd_cron() {
-  local action="${1:-ls}"; shift || true
-  case "$action" in
-    ls|list)           _cron_ls "$@" ;;
-    add|enable)        _cron_set add "$@" ;;
-    rm|remove|disable) _cron_set rm "$@" ;;
-    *) die "cron action must be: ls [wt] | add <id> [wt] | rm <id> [wt]" ;;
-  esac
-}
-_cron_allowlist() { grep -E '^INNGEST_LOCAL_ENABLED_CRONS=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true; }
-# Crons that need EXTRA env beyond being enabled (the var is usually read in a helper the
-# cron imports, so it can't be auto-detected reliably). THE LIST GROWS — add a cron -> var
-# here whenever you find one. Space-separated if a cron needs more than one.
-_cron_env_hint() {
-  case "$1" in
-    call-flow-recording-stitch-cron) echo "CALL_FLOW_STITCH_TEAM_IDS" ;;
-    *) echo "" ;;
-  esac
-}
-_cron_ls() {
-  local wt; wt="$(resolve_worktree "${1:-}")"
-  local envf="$wt/apps/web/.env.local"
-  local on; on="$(_cron_allowlist "$envf")"
-  echo "inngest crons in $(basename "$wt")  (● enabled · ⚠ needs env that's unset):"
-  local f id sched mark need v extra
-  for f in "$wt"/apps/web/lib/inngest/functions/*.ts; do
-    grep -q "{ cron:" "$f" 2>/dev/null || continue
-    id="$(grep -oE "id: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/id: //; s/'//g" || true)"
-    [ -n "$id" ] || continue
-    sched="$(grep -oE "cron: '[^']+'" "$f" 2>/dev/null | head -1 | sed "s/cron: //; s/'//g" || true)"
-    case ",$on," in *",$id,"*) mark='●';; *) mark=' ';; esac
-    extra=""; need="$(_cron_env_hint "$id")"
-    for v in $need; do
-      if grep -qE "^$v=" "$envf" 2>/dev/null; then extra="$extra  needs $v ✓"; else extra="$extra  ⚠ needs $v"; fi
-    done
-    printf '  %s %-46s %-14s%s\n' "$mark" "$id" "$sched" "$extra"
-  done
-}
-_cron_set() {
-  local op="$1" id="${2:?usage: avoca-dev cron $1 <cron-id> [worktree]}"; local wt; wt="$(resolve_worktree "${3:-}")"
-  local envf="$wt/apps/web/.env.local"
-  [ -f "$envf" ] || die "no $envf — run 'avoca-dev db setdev $(basename "$wt")' first"
-  local cur new; cur="$(_cron_allowlist "$envf")"
-  if [ "$op" = add ]; then
-    new="$(echo "$cur,$id" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)"
-  else
-    new="$(echo "$cur"     | tr ',' '\n' | awk -v x="$id" 'NF && $0!=x && !seen[$0]++' | paste -sd, -)"
-  fi
-  grep -vE '^INNGEST_LOCAL_ENABLED_CRONS=' "$envf" > "$envf.tmp" && mv "$envf.tmp" "$envf"
-  [ -n "$new" ] && printf 'INNGEST_LOCAL_ENABLED_CRONS=%s\n' "$new" >> "$envf"
-  log "$([ "$op" = add ] && echo enabled || echo disabled) cron '$id' in $(basename "$wt")"
-  log "  INNGEST_LOCAL_ENABLED_CRONS=${new:-<empty>}  — restart the dev server to apply"
 }
 
 # ── up: seamless local dev in one shot ────────────────────────────────────
@@ -1033,7 +937,6 @@ case "${1:-}" in
   seed)    shift; cmd_seed "$@";;
   migrate) shift; cmd_migrate "$@";;
   types)   shift; cmd_types "$@";;
-  cron)    shift; cmd_cron "$@";;
   db)      shift; cmd_db "$@";;
   up)      shift; cmd_up "$@";;
   oauth)   shift; cmd_oauth "$@";;
