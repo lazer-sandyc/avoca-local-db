@@ -28,9 +28,10 @@ DO $$
 DECLARE
   v_ent_id   bigint := 990000;
   v_owner_id uuid   := 'b0000000-0000-0000-0000-000000000001';  -- synthetic test owner
-  v_n_teams  int    := 3;              -- bump to add teams
+  v_n_teams  int    := 1;              -- bump to add teams (names gain a numeric suffix)
   t          int;
   v_team_id  bigint;
+  v_label    text;                     -- 'Test Team' (single) or 'Test Team N' (many)
   en_va uuid; es_va uuid; en_ac uuid; es_ac uuid;
   en_td bigint; es_td bigint;
   en_phone bigint; es_phone bigint;
@@ -60,6 +61,7 @@ BEGIN
   -- ---- teams, each with an English + Spanish agent ----
   FOR t IN 1..v_n_teams LOOP
     v_team_id := 990000 + t;
+    v_label   := CASE WHEN v_n_teams > 1 THEN 'Test Team ' || t ELSE 'Test Team' END;
     plat      := CASE WHEN t = 2 THEN 'elevenlabs' ELSE 'vapi' END;
 
     en_va    := ('a0000000-0000-0000-0000-' || lpad((t*10+1)::text, 12, '0'))::uuid;
@@ -72,12 +74,12 @@ BEGIN
     es_num   := '+1999555' || lpad((t*10+2)::text, 4, '0');
 
     INSERT INTO teams (id, name, enterprise_id, owner_id)
-      VALUES (v_team_id, 'Test Auto ' || t, v_ent_id, v_owner_id);
+      VALUES (v_team_id, v_label, v_ent_id, v_owner_id);
 
     -- voice assistants (own their inbound number; point at their agent config)
     INSERT INTO voice_assistants (id, team_id, name)
-      VALUES (en_va, v_team_id, 'Test Auto ' || t || ' — English'),
-             (es_va, v_team_id, 'Test Auto ' || t || ' — Spanish');
+      VALUES (en_va, v_team_id, v_label || ' — English'),
+             (es_va, v_team_id, v_label || ' — Spanish');
 
     -- inbound phone numbers (routing + transfer-destination match key)
     INSERT INTO phone_numbers (id, team_id, phone_number)
@@ -86,8 +88,8 @@ BEGIN
 
     -- agent configs
     INSERT INTO assistant_configs (id, team_id, assistant_mode, voice_assistant_id, name, platform)
-      VALUES (en_ac, v_team_id, 'blueprint', en_va, 'Test Auto ' || t || ' — English', plat),
-             (es_ac, v_team_id, 'blueprint', es_va, 'Test Auto ' || t || ' — Spanish', plat);
+      VALUES (en_ac, v_team_id, 'blueprint', en_va, v_label || ' — English', plat),
+             (es_ac, v_team_id, 'blueprint', es_va, v_label || ' — Spanish', plat);
 
     -- wire each voice assistant to its inbound number + default agent config
     UPDATE voice_assistants

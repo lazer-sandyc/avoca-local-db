@@ -318,6 +318,9 @@ _purge_team_local() {
   local team="$1"
   lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
+delete from public.knowledge_bases                 where team_id=$team;
+delete from public.team_call_reasons               where team_id=$team;
+delete from public.team_transfer_reasons           where team_id=$team;
 delete from public.assistant_variables_versions   where team_id=$team;
 delete from public.assistant_variables             where team_id=$team;
 delete from public.transfer_destination_assistants where team_id=$team;
@@ -384,6 +387,7 @@ cmd_duplicate_team() {
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
   [ -n "$name" ] || die "no team $team in prod"
+  local src_ent; src_ent="$(_src_psql "$url" -tAqc "select enterprise_id from public.teams where id=$team" 2>/dev/null | tr -d '[:space:]')"
   _ensure_synthetic_owner   # create the synthetic owner/enterprise if missing (no 'seed' prereq)
   log "duplicate team $team ('$name') from $SOURCE_DB (READ-ONLY; config only; provider handles scrubbed)"
 
@@ -396,11 +400,39 @@ cmd_duplicate_team() {
   _pull "$url" assistant_config_versions       "config_id in (select id from public.assistant_configs where team_id=$team)"
   _pull "$url" transfer_destinations           "team_id=$team"
   _pull "$url" transfer_destination_assistants "team_id=$team"
+  # Prompt inputs + reasons: the KB feeds the compiled agent prompt (service info,
+  # hours, FAQs) — without it a cloned team's calls fail. team_transfer_reasons
+  # backs transfer_destinations.transfer_reason_ids; team_call_reasons backs
+  # bookability/call-reason tagging. All per-team rows keyed by team_id.
+  _pull "$url" knowledge_bases                 "team_id=$team"
+  _pull "$url" team_call_reasons               "team_id=$team"
+  _pull "$url" team_transfer_reasons           "team_id=$team"
   _pull "$url" responder_webhook_configs       "team_id=$team"
   _pull "$url" assistant_variables             "team_id=$team"
   _pull "$url" assistant_variables_versions    "team_id=$team"
 
-  # Re-attach to the synthetic owner/enterprise (no PII), scrub the agent-level
+  # Make sure THIS team's own enterprise exists locally (just the enterprise row,
+  # not its sibling teams), so the copy keeps its real enterprise instead of the
+  # synthetic one. Skip if already local (another duplicated team shares it), and
+  # fall back to the synthetic enterprise when the source team has none.
+  local attach_ent="$SEED_ENTERPRISE_ID"
+  if [ -n "$src_ent" ] && [ "$src_ent" != "$SEED_ENTERPRISE_ID" ]; then
+    if [ -n "$(lsql -tAc "select 1 from enterprises where id=$src_ent" 2>/dev/null)" ]; then
+      log "  enterprise $src_ent already local — reuse"
+    else
+      log "  ↳ duplicating the team's enterprise $src_ent"
+      _pull "$url" enterprises "id=$src_ent"
+      # billing handle + default template are prod-scoped: null them so nothing
+      # local chases a dangling template FK or a real Orb customer.
+      lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+update public.enterprises set orb_customer_id=null, default_template_id=null where id=$src_ent;
+SQL
+    fi
+    attach_ent="$src_ent"
+  fi
+
+  # Re-attach to the synthetic owner + the team's own enterprise (no PII), scrub the agent-level
   # provider handle, and DELETE the copied phone numbers outright. We keep none
   # of prod's numbers: they'd be inert config at best, and a rediscovery risk at
   # worst — once ISV creds are present locally (required to test telephony), the
@@ -412,7 +444,7 @@ cmd_duplicate_team() {
   # copied, so only voice_assistants / transfer_destinations point at a number.
   lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
-update public.teams set owner_id='$SEED_OWNER_ID', enterprise_id=$SEED_ENTERPRISE_ID where id=$team;
+update public.teams set owner_id='$SEED_OWNER_ID', enterprise_id=$attach_ent where id=$team;
 update public.voice_assistants
    set main_inbound_call_phone_id=null, backup_inbound_call_phone_id=null, test_inbound_call_phone_id=null
  where team_id=$team;
@@ -444,13 +476,15 @@ SQL
     fi
   done
 
-  # NOTE: cloning is CONFIG-ONLY — it deliberately does NOT touch Twilio. The value
-  # here is not rebuilding a team's blueprint/agents from scratch; the telephony bits
-  # are a quick manual UI step when (if) you actually need to place a call, and
-  # auto-provisioning real (billed) subaccounts on every clone is over-automation.
-  # If you do need to test calls on this team: 'avoca-dev twilio provision $team'
-  # then buy a test number in the UI.
-  log "done — team $team ('$name') config is in local (numbers dropped; provider handles scrubbed; owner→synthetic)."
+  # Auto-provision the team's Twilio ISV subaccount so the copy is call-ready.
+  # Best-effort in a subshell: missing ISV creds or an API error warns but never
+  # aborts the (already-complete) config clone. Idempotent — _tw_provision_one
+  # skips a team that already has a subaccount. This provisions the subaccount
+  # only; buy a test number in the UI to actually place a call.
+  ( _twilio_creds && _tw_provision_one "$team" ) \
+    || log "  twilio ISV not provisioned (no ISV creds, or API error) — run 'avoca-dev twilio provision $team' when ready"
+
+  log "done — team $team ('$name') config + own enterprise in local (numbers dropped; provider handles scrubbed; owner→synthetic; twilio ISV provisioned — buy a number to place calls)."
   if [ -z "$calls_off" ]; then
     if [ -n "$calls_limit" ]; then cmd_dup_calls "$team" --limit "$calls_limit"
     else cmd_dup_calls "$team" --since "$calls_since"; fi
@@ -586,7 +620,7 @@ _seed_login() {
 cmd_seed() {
   need psql
   _ensure_synthetic_owner   # base.sql attaches the Test Auto teams to this
-  log "load synthetic Test Auto teams (English/Spanish agents + transfer destinations)"
+  log "load synthetic Test Team (English/Spanish agents + transfer destinations)"
   lsql -q -f "$SELF_DIR/seed/base.sql" 2>&1 | grep -iE 'error|^ *[a-z].*\| *[0-9]' | head -20 || true
   _seed_login
   # Twilio subaccounts are NOT provisioned here — do it on demand from the app UI,
