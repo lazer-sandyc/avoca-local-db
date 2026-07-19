@@ -368,13 +368,14 @@ cmd_delete_team() {
 # the synthetic seed owner/enterprise so no owner PII is copied. Referenced
 # modular blueprints are auto-pulled. Idempotent (drops any prior copy first).
 cmd_duplicate_team() {
-  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls]}"; shift || true
+  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls | --yes]}"; shift || true
   # By DEFAULT we also import the team's last week of real calls. This only yields data
   # when SOURCE_DB=production (calls live in prod; staging is call-empty), so it's a
   # harmless no-op on the default staging source. --no-calls = config only (no call PII).
-  local calls_since=7 calls_limit="" calls_off=""
+  local calls_since=7 calls_limit="" calls_off="" force_dup=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --yes|-y|--force) force_dup=1; shift;;
       --no-calls)     calls_off=1; shift;;
       --with-calls)   shift;;                       # accepted alias — default is already on
       --with-calls=*) calls_limit="${1#*=}"; shift;;
@@ -382,7 +383,7 @@ cmd_duplicate_team() {
       --since=*)      calls_since="${1#*=}"; shift;;
       --limit)        calls_limit="${2:?--limit needs a number}"; shift 2;;
       --limit=*)      calls_limit="${1#*=}"; shift;;
-      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls])";;
+      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls | --yes])";;
     esac
   done
   need psql
@@ -393,7 +394,24 @@ cmd_duplicate_team() {
   _ensure_synthetic_owner   # create the synthetic owner/enterprise if missing (no 'seed' prereq)
   log "duplicate team $team ('$name') from $SOURCE_DB (READ-ONLY; config only; provider handles scrubbed)"
 
-  _purge_team_local "$team"   # drop any prior copy so re-runs are idempotent
+  # A re-clone is a RESET, not a merge: _purge_team_local deletes every local row
+  # for this team and re-pulls a clean copy. That silently destroys local edits
+  # (numbers you provisioned, assistant tweaks). Warn + confirm when the team is
+  # already local (i.e. there's something to lose); first clones have nothing to
+  # lose, so no prompt. --yes/-y skips it.
+  if [ -z "$force_dup" ] && [ -n "$(lsql -tAc "select 1 from teams where id=$team limit 1" 2>/dev/null)" ]; then
+    echo "" >&2
+    echo "  ⚠️  WARNING — team $team ('$name') is ALREADY in your local DB." >&2
+    echo "     duplicate-team is a RESET, not a merge: it DELETES every local row for" >&2
+    echo "     this team (provisioned numbers, assistant edits, all of it) and re-pulls" >&2
+    echo "     a clean copy from $SOURCE_DB. Any local changes will be LOST." >&2
+    echo "" >&2
+    printf "  Overwrite local team %s? [y/N] " "$team" >&2
+    local reply; read -r reply
+    case "$reply" in y|Y|yes|YES) : ;; *) die "aborted — local team $team left untouched (use --yes to skip this prompt)" ;; esac
+  fi
+
+  _purge_team_local "$team"   # drop any prior copy, then re-pull a clean source copy
 
   _pull "$url" teams                           "id=$team"
   _pull "$url" phone_numbers                   "team_id=$team"
