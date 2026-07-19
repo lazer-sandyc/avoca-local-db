@@ -20,7 +20,7 @@
 #   avoca-dev db status  [worktree] # show which db each app is on
 #   avoca-dev migrate [up|pending|executed] [wt]  # run unmerged migrations against LOCAL (the cheap loop)
 #   avoca-dev types      [worktree] # regen Supabase types from the LOCAL schema (not prod)
-#   avoca-dev up         [worktree] # seamless: point local + drop stale bundle + pnpm dev
+#   avoca-dev up         [worktree] # bring the local DB up + point env local + drop stale bundle (you run pnpm dev)
 #   avoca-dev oauth <client-id> <secret>   # wire Google sign-in locally (needs a stack restart)
 #   avoca-dev trim                  # cut the Supabase stack to the ~7 containers we use
 #   avoca-dev twilio provision   [team]   # subaccount for one team, or (no arg) every seeded team — idempotent (seed does this too)
@@ -759,6 +759,11 @@ cmd_db() {
 # ── up: seamless local dev in one shot ────────────────────────────────────
 cmd_up() {
   local wt; wt="$(resolve_worktree "${1:-}")"
+  # Bring the local DB stack up (idempotent — no-op if already running). This is
+  # the ONLY process `up` starts: the database. It does NOT run the app dev
+  # server — you start `pnpm dev` / `pnpm start` yourself.
+  local running; running="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "supabase_.*$(basename "$LOCAL_DB_DIR")" || true)"
+  [ "${running:-0}" -gt 0 ] || _stack_up
   cmd_db setdev "$wt" >/dev/null
   local app nx
   for app in web dashboard; do
@@ -767,8 +772,8 @@ cmd_up() {
       log "dropping stale $app/.next (prod URL was baked into the bundle)"; rm -rf "$nx"
     fi
   done
-  log "$(basename "$wt")/apps/web → pnpm dev (local DB, fresh bundle)"
-  cd "$wt/apps/web"; exec pnpm dev
+  log "$(basename "$wt") → LOCAL db up + env pointed local + stale bundle dropped."
+  echo "  now start the app yourself:  cd $wt/apps/web && pnpm dev"
 }
 
 # ── oauth: wire Google sign-in on the local stack ─────────────────────────
