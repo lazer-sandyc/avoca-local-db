@@ -114,9 +114,10 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | `avoca-dev duplicate-bp <id>` | Copy a modular blueprint (row + versions + assistant variables) from the source (READ-ONLY) so the builder / clone-from-template works. Idempotent. |
 | `avoca-dev duplicate-team <id>` | Copy a team's **config** into local — agents, voice assistants, transfer destinations, variables, and any blueprints they use — from staging (default) or prod (`SOURCE_DB=production`). Config only: **not** runtime data (calls/CRM/analytics); phone numbers dropped, provider handles scrubbed, owner→synthetic. Does **not** touch Twilio (buy a test number in the UI if you need to place calls). |
 | `avoca-dev delete-team <id>` | Inverse of `duplicate-team` — releases the team's local Twilio subaccount (tag-gated) then purges its config from local. The DB is shared across all worktrees, so remove a test team when you're done with it (not per-worktree). |
-| `avoca-dev db setdev [wt]` | Point a worktree's env (apps/web + apps/dashboard) at the **local** DB. |
-| `avoca-dev db setprod [wt]` | Revert it to **prod** (strips the local overrides). |
+| `avoca-dev db setdev [wt]` | Point **every** `apps/*/.env.local` present at the **local** DB (not hardcoded to web+dashboard — any app with its own `.env.local` is covered), then verifies. |
+| `avoca-dev db setprod [wt]` | Revert every app back to **prod** (strips the local overrides). |
 | `avoca-dev db status [wt]` | Show which DB each app is on. |
+| `avoca-dev db verify [wt]` | Assert every app's `.env.local` resolves (dotenv last-wins) to a **local** host for `POSTGRES_URL`/`POSTGRES_HOST`/`NEXT_PUBLIC_SUPABASE_URL`/`SUPABASE_URL`. Fails loud, naming the app + var + value, and exits non-zero on any remote host — so a half-local worktree can't go undetected. Runs automatically at the end of `setdev`; callable standalone too. |
 | `avoca-dev migrate [up\|pending\|executed\|down] [wt]` | Run the worktree's **unmerged** migrations against the LOCAL DB (default `up`). Wraps `pnpm db:up`, exporting the local `POSTGRES_*` umzug needs — and hard-pins the target to local, so it can never touch prod. |
 | `avoca-dev types [wt]` | Regenerate `packages/db/src/generated/supabase.generated.ts` from the **local** schema (the repo's own `gen-supabase-types` types against prod). Run it after `migrate` so your types reflect the migration you just applied, before it's merged. |
 | `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next` + `pnpm dev`, in one shot. |

@@ -12,12 +12,20 @@
 #   avoca-dev duplicate-bp   <id>   # copy a modular blueprint (+versions/variables) from the source
 #   avoca-dev duplicate-team <id>   # copy a team's CONFIG + its last week of real calls (calls need SOURCE_DB=production)
 #   avoca-dev duplicate-team <id> --no-calls | --since <days> | --limit <n>   # config-only / widen / cap the call import
+#     ^ THE sanctioned way to get a specific/missing team's real data locally (e.g. a
+#       prod-only team not on staging) — not a second provisioning tool. There is exactly
+#       one local-DB provisioner (this file); don't stand up a second one.
 #   avoca-dev dup-calls      <id> [--since <days> | --limit <n>]  # import real calls into an already-cloned local team (default: last week)
 #   avoca-dev delete-team    <id>   # inverse: release its local Twilio subaccount + purge the team from local
 #   avoca-dev db up|down|cycle      # start / stop / restart the local Supabase stack (handles the -x excludes)
-#   avoca-dev db setdev  [worktree] # point a worktree's env at the LOCAL db
-#   avoca-dev db setprod [worktree] # revert it to the PROD db
+#   avoca-dev db setdev  [worktree] # point EVERY apps/*/.env.local present at the LOCAL db (not hardcoded to
+#                                   # web+dashboard — any app with its own .env.local is covered), then verifies
+#   avoca-dev db setprod [worktree] # revert every app back to the PROD db
 #   avoca-dev db status  [worktree] # show which db each app is on
+#   avoca-dev db verify  [worktree] # assert every app's .env.local resolves (dotenv last-wins) to a LOCAL
+#                                   # host for POSTGRES_URL/POSTGRES_HOST/NEXT_PUBLIC_SUPABASE_URL/SUPABASE_URL —
+#                                   # fails loud naming app+var+value and exits non-zero on any remote host.
+#                                   # Runs automatically at the end of setdev; callable standalone too.
 #   avoca-dev migrate [up|pending|executed] [wt]  # run unmerged migrations against LOCAL (the cheap loop)
 #   avoca-dev types      [worktree] # regen Supabase types from the LOCAL schema (not prod)
 #   avoca-dev up         [worktree] # bring the local DB up + point env local + drop stale bundle (you run pnpm dev)
@@ -59,7 +67,11 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Global config tables synced from prod so a local matches what people expect from
 # production (staging is sparse on these). THE LIST GROWS — add a table here whenever a
 # prod-only global setting bites you locally (feature flags were the first beyond lookups).
-SYNC_CORE="voices,llm_models,transcribers,feature_flags"
+# test_suite_templates/test_suite_template_cases: simulation-v2's GLOBAL (no team scope)
+# default test suites — without them the v2 "Start Run" sheet comes up empty. Parent listed
+# before child; harmless with FK triggers off, but keeps the reload order legible. Ported
+# from the now-retired scripts/setup-local-db.sh so this stays the one seeding path.
+SYNC_CORE="voices,llm_models,transcribers,feature_flags,test_suite_templates,test_suite_template_cases"
 
 die() { echo "avoca-dev: $*" >&2; exit 1; }
 log() { echo "▸ $*"; }
@@ -150,7 +162,8 @@ SQL
 
   cmd_grants
   cmd_ledger
-  cmd_reference             # sync global prod config (lookups + feature flags) so local matches production
+  cmd_reference             # sync global prod config (lookups + feature flags + sim-v2 test suites) so local matches production
+  _seed_global_variables    # global assistant_variables module library (transfer gating, language mode, speaking style)
   _ensure_synthetic_owner   # synthetic owner/enterprise so duplicate-team works out of the box (NOT the Test Auto teams)
   _seed_login               # local login user
   log "setup done. Log in as $LOGIN_EMAIL, and clone a real team: SOURCE_DB=production avoca-dev duplicate-team <id>"
@@ -246,6 +259,27 @@ cmd_reference() {
     local n; n="$(lsql -tAc "select count(*) from public.$t" 2>/dev/null || echo '?')"
     log "  $t: $n rows"
   done
+}
+
+# GLOBAL-scoped assistant_variables (team_id/assistant_config_id/enterprise_id/
+# blueprint_id all NULL) are the shared module library — module_variables,
+# module_speaking_style_instructions, module_language_mode, etc. Blueprints
+# reference them by name at compile time; without them, transfer gating,
+# language mode, and speaking style render EMPTY (silent break). Ported from the
+# now-retired scripts/setup-local-db.sh so this stays the one seeding path.
+#
+# NOT folded into SYNC_CORE/cmd_reference: that loop does a blanket
+# `DELETE FROM public.<table>` per table, which would also wipe every
+# team/config/blueprint-scoped assistant_variables row `duplicate-team` /
+# `duplicate-bp` already pulled in. The DELETE here is scoped to the same
+# global-only WHERE as the reload, so it only ever touches global rows.
+_seed_global_variables() {
+  need psql
+  local src_url; src_url="$(SOURCE_DB="$REFERENCE_SOURCE" _source_url)"
+  local scope="team_id IS NULL AND assistant_config_id IS NULL AND enterprise_id IS NULL AND blueprint_id IS NULL"
+  log "sync global assistant_variables (shared module library) from $REFERENCE_SOURCE"
+  printf 'SET session_replication_role=replica;\nDELETE FROM public.assistant_variables WHERE %s;\n' "$scope" | lsql -q >/dev/null 2>&1 || true
+  _pull "$src_url" assistant_variables "$scope"
 }
 
 # ── duplicate: copy a real prod record graph (config only) into local ─────
@@ -587,8 +621,25 @@ SQL
 # app gets 'permission denied for schema public' via PostgREST).
 cmd_grants() {
   log "grant anon/authenticated/service_role on the app schemas"
-  local schemas_sql="ARRAY['${APP_SCHEMAS//,/\',\'}']"
-  lsql -q <<SQL 2>/dev/null
+  # NOTE: no backslash before the quotes here — we're already inside a double-quoted
+  # bash string, where '\'' isn't a recognized escape (only \$ \` \" \\ are), so a
+  # backslash-quote pattern survives into the value LITERALLY and corrupts the SQL
+  # array literal (silently, if stderr is swallowed downstream). Verified bug.
+  local schemas_sql="ARRAY['${APP_SCHEMAS//,/','}']"
+  # Real errors must surface — a prior version piped stderr to /dev/null here and the
+  # broken schemas_sql above went undetected across multiple runs (it always printed
+  # "success" while granting nothing). Two things are required for that, not one:
+  #   1. -v ON_ERROR_STOP=1 — psql fed a script via stdin (not -c) returns exit 0
+  #      even when a statement inside errors, UNLESS this is set (verified live:
+  #      without it, a deliberately-broken DO block still exited 0). With it, a
+  #      failing statement aborts the script and psql exits 3.
+  #   2. Capturing $? from the command substitution BEFORE piping through grep —
+  #      piping loses the original exit code unless read immediately.
+  # Only the (harmless, expected) "no privileges were granted for ..." warnings
+  # from GRANT ALL ON ALL ROUTINES touching extension-owned functions are
+  # filtered from the DISPLAYED output, after rc is already captured.
+  local out rc
+  out="$(lsql -q -v ON_ERROR_STOP=1 <<SQL 2>&1
 DO \$\$
 DECLARE s text;
 BEGIN
@@ -603,6 +654,14 @@ BEGIN
   END LOOP;
 END \$\$;
 SQL
+)"; rc=$?
+  printf '%s\n' "$out" | grep -v 'no privileges were granted for' || true
+  [ "$rc" -eq 0 ] || die "grant SQL failed (exit $rc) — see output above. Schemas were NOT granted; the app will hit 'permission denied for schema public'."
+  # Belt-and-suspenders: confirm at least one role actually has USAGE, since a
+  # future regression in schemas_sql could in principle produce SQL that's
+  # syntactically valid but semantically wrong (e.g. an empty array).
+  local have; have="$(lsql -tAc "select has_schema_privilege('anon','public','USAGE')" 2>/dev/null)"
+  [ "$have" = t ] || die "grant SQL reported success but anon still lacks USAGE on public — inspect cmd_grants"
 }
 
 # Seed the umzug ledger from origin/main so 'db:up' only runs unmerged migrations.
@@ -743,9 +802,54 @@ _enable_dupes() { # $1=file — restore every tagged original
   local f="$1"; [ -f "$f" ] || return 0
   perl -i -pe "s{^\Q${OFF_TAG}\E}{}" "$f"
 }
+# List every app dir under a worktree that has its own .env.local — the set
+# avoca-dev's DB-pointing, verify, and .next-wipe steps all operate over. NOT
+# hardcoded to apps/web + apps/dashboard: any app that gains its own .env.local
+# (a dashboard-style page querying Postgres/Supabase directly, e.g. via
+# @server/supabase/postgres + a service client) is picked up automatically —
+# leaving one out silently is exactly the split-brain this generalizes away.
+_apps_with_env() {
+  local wt="$1" d
+  for d in "$wt"/apps/*/; do
+    [ -f "${d}.env.local" ] && basename "$d"
+  done
+  return 0   # under `set -e`, a bare for-loop as the last statement propagates its
+             # LAST iteration's exit status — the last app alphabetically almost never
+             # has a .env.local, so without this the function "fails" and, called as
+             # apps="$(_apps_with_env "$wt")" (an unguarded assignment), silently kills
+             # the whole script. Verified live: db status/verify produced zero output
+             # and exited with no error message until this was added.
+}
+# Resolve the dotenv-last-assignment-wins effective value of every DB-hostish
+# var in each app's .env.local and assert it's local (127.0.0.1/localhost). A
+# remote value here means an app is silently still reading/writing PROD even
+# though the worktree "looks" pointed local — printed as a clear FAIL naming
+# the app + var (not just a generic failure), so a half-local worktree can't
+# be created silently. Ported from the toolkit's verify-local-worktree check.
+_db_verify_worktree() {
+  local wt="$1" apps="$2" app f v val fail=0
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    f="$wt/apps/$app/.env.local"
+    for v in POSTGRES_URL POSTGRES_HOST NEXT_PUBLIC_SUPABASE_URL SUPABASE_URL; do
+      val="$(grep -E "^${v}=" "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+      [ -n "$val" ] || continue
+      case "$val" in
+        *127.0.0.1*|*localhost*) : ;;
+        *) echo "  FAIL: apps/$app/.env.local — $v resolves to a REMOTE host: $val" >&2; fail=1 ;;
+      esac
+    done
+  done <<< "$apps"
+  return $fail
+}
 # NEXT_PUBLIC_* are baked into .next at build time, so a stale build keeps serving the
 # old db URL to the browser after a switch. Wipe it so the next `pnpm dev` rebuilds clean.
-_wipe_next() { local wt="$1"; rm -rf "$wt/apps/web/.next" "$wt/apps/dashboard/.next" 2>/dev/null || true; }
+_wipe_next() {
+  local wt="$1" app
+  while IFS= read -r app; do
+    [ -n "$app" ] && rm -rf "$wt/apps/$app/.next" 2>/dev/null || true
+  done < <(_apps_with_env "$wt")
+}
 # Bring the local Supabase stack up (excluding the flaky/unneeded containers), down, or cycle it.
 _stack_up() {
   need supabase
@@ -756,66 +860,96 @@ _stack_up() {
   return $rc
 }
 cmd_db() {
-  local action="${1:?usage: avoca-dev db <up|down|cycle|setdev|setprod|status> [worktree]}"
+  local action="${1:?usage: avoca-dev db <up|down|cycle|setdev|setprod|status|verify> [worktree]}"
   case "$action" in
     up)    _stack_up; return ;;
     down)  need supabase; log "stopping local stack (data kept; pass --no-backup to wipe)"; ( cd "$LOCAL_DB_DIR" && supabase stop "${@:2}" ) | tail -3 | sed 's/^/  /'; return ;;
     cycle) need supabase; log "cycling local stack"; ( cd "$LOCAL_DB_DIR" && supabase stop >/dev/null 2>&1 || true ); _stack_up; return ;;
   esac
   local wt; wt="$(resolve_worktree "${2:-}")"
-  local web="$wt/apps/web/.env.local" dash="$wt/apps/dashboard/.env.local"
   local env; env="$(sb_env)"; LOCAL_API="$(sbval "$env" API_URL)"; LOCAL_API="${LOCAL_API:-http://127.0.0.1:54321}"
+
+  # Every app under the worktree that has its own .env.local — not hardcoded to
+  # apps/web + apps/dashboard. See _apps_with_env's comment for why.
+  local apps; apps="$(_apps_with_env "$wt")"
 
   if [ "$action" = status ]; then
     echo "avoca-dev db  ($(basename "$wt"))"
-    for pair in "apps/web:$web" "apps/dashboard:$dash"; do
-      local app="${pair%%:*}" f="${pair#*:}" url tag
-      [ -f "$f" ] || { echo "  $app: (no .env.local)"; continue; }
+    if [ -z "$apps" ]; then echo "  (no apps/*/.env.local found)"; return 0; fi
+    local app f url tag
+    while IFS= read -r app; do
+      [ -n "$app" ] || continue
+      f="$wt/apps/$app/.env.local"
       url="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
       case "$url" in *127.0.0.1*|*localhost*) tag="LOCAL";; *) tag="prod ";; esac
-      echo "  $app: $tag  (supabase=$url)"
-    done; return 0
+      echo "  apps/$app: $tag  (supabase=${url:-none})"
+    done <<< "$apps"
+    return 0
   fi
 
-  # keys the managed block re-defines — must not stay live as originals in dev mode
-  local WEB_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD POSTGRES_URL NEXT_PUBLIC_DASHBOARD_URL"
-  local DASH_DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_URL WEB_APP_URL NEXT_PUBLIC_WEB_APP_URL"
+  if [ "$action" = verify ]; then
+    [ -n "$apps" ] || die "no apps/*/.env.local found under $wt"
+    if _db_verify_worktree "$wt" "$apps"; then
+      log "verify OK — $(basename "$wt"): every app resolves to local (127.0.0.1/localhost)."
+      return 0
+    fi
+    die "verify FAILED for $(basename "$wt") — see FAIL lines above."
+  fi
+
+  # Keys the managed block re-defines — must not stay live as originals in dev mode,
+  # or the browser bundle (NEXT_PUBLIC_* inlined at build time) can point at the
+  # REMOTE db while the server-side reads local (split-brain). Same set for every
+  # app: DB-pointing is uniform across apps/*. App-URL vars (WEB_APP_URL,
+  # NEXT_PUBLIC_DASHBOARD_URL, ...) are NOT part of this — those are a toolkit/
+  # worktree concern (FDE overrides / tunnel), not the DB switch.
+  local DUP_KEYS="NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SECRET_KEY POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD POSTGRES_URL"
 
   if [ "$action" = setprod ] || [ "$action" = prod ]; then
-    strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
-    _enable_dupes "$web"; [ -f "$dash" ] && _enable_dupes "$dash"
+    [ -n "$apps" ] || die "no apps/*/.env.local found under $wt"
+    local app f
+    while IFS= read -r app; do
+      [ -n "$app" ] || continue
+      f="$wt/apps/$app/.env.local"
+      strip_block "$f"; _enable_dupes "$f"
+    done <<< "$apps"
     _wipe_next "$wt"
     log "$(basename "$wt") → PROD (restored originals; reverts to Vercel-pulled values; .next wiped)"
     echo "  restart any running dev server to apply."; return 0
   fi
-  [ "$action" = setdev ] || [ "$action" = dev ] || [ "$action" = local ] || die "action must be setdev, setprod, or status"
+  [ "$action" = setdev ] || [ "$action" = dev ] || [ "$action" = local ] || die "action must be setdev, setprod, status, or verify"
+  [ -n "$apps" ] || die "no apps/*/.env.local found under $wt"
 
   # Read the local keys BEFORE mutating any env file. If the stack is down, sbval returns
-  # empty — fail HERE with the file untouched, rather than after strip_block/_disable_dupes
+  # empty — fail HERE with every file untouched, rather than after strip_block/_disable_dupes
   # (which would leave the originals commented AND no managed block = zero live Supabase URL).
   local anon svc; anon="$(sbval "$env" ANON_KEY)"; svc="$(sbval "$env" SERVICE_ROLE_KEY)"
   [ -n "$anon" ] && [ -n "$svc" ] || die "couldn't read local Supabase keys — is the stack up? (run: avoca-dev db up)"
 
-  strip_block "$web"; [ -f "$dash" ] && strip_block "$dash"
-  _disable_dupes "$web" $WEB_DUP_KEYS
-  { echo ""; echo "$BEGIN_MARK"
-    echo "POSTGRES_HOST=127.0.0.1"; echo "POSTGRES_PORT=54322"; echo "POSTGRES_DB=postgres"
-    echo "POSTGRES_USER=postgres"; echo "POSTGRES_PASSWORD=postgres"
-    echo "POSTGRES_URL=$LOCAL_PG_URL"
-    echo "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API"; echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
-    echo "SUPABASE_SECRET_KEY=$svc"; echo "NEXT_PUBLIC_DASHBOARD_URL=http://localhost:3002"
-    echo "$END_MARK"; } >> "$web"
-  if [ -f "$dash" ]; then
-    _disable_dupes "$dash" $DASH_DUP_KEYS
+  local app f
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    f="$wt/apps/$app/.env.local"
+    strip_block "$f"
+    _disable_dupes "$f" $DUP_KEYS
     { echo ""; echo "$BEGIN_MARK"
+      echo "POSTGRES_HOST=127.0.0.1"; echo "POSTGRES_PORT=54322"; echo "POSTGRES_DB=postgres"
+      echo "POSTGRES_USER=postgres"; echo "POSTGRES_PASSWORD=postgres"
+      echo "POSTGRES_URL=$LOCAL_PG_URL"
       echo "NEXT_PUBLIC_SUPABASE_URL=$LOCAL_API"; echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
-      echo "SUPABASE_SECRET_KEY=$svc"; echo "POSTGRES_URL=$LOCAL_PG_URL"
-      echo "WEB_APP_URL=http://localhost:3000"; echo "NEXT_PUBLIC_WEB_APP_URL=http://localhost:3000"
-      echo "$END_MARK"; } >> "$dash"
-  fi
+      echo "SUPABASE_SECRET_KEY=$svc"
+      echo "$END_MARK"; } >> "$f"
+  done <<< "$apps"
   _wipe_next "$wt"
-  log "$(basename "$wt") → DEV/local  (web:3000 dashboard:3002 → $LOCAL_API / pg 54322; .next wiped)"
-  echo "  restart any running dev server to apply (or use 'avoca-dev up')."
+
+  # Fail loud rather than leaving a half-local worktree undetected — see
+  # _db_verify_worktree. This is what makes a half-local worktree impossible to
+  # create silently: setdev itself checks its own work before declaring victory.
+  if _db_verify_worktree "$wt" "$apps"; then
+    log "$(basename "$wt") → DEV/local  (apps: $(echo "$apps" | tr '\n' ' ')→ $LOCAL_API / pg 54322; .next wiped)"
+    echo "  restart any running dev server to apply (or use 'avoca-dev up')."
+  else
+    die "verify FAILED after setdev — see FAIL lines above. Do not trust this worktree as local until fixed."
+  fi
 }
 
 # ── up: seamless local dev in one shot ────────────────────────────────────
@@ -828,12 +962,13 @@ cmd_up() {
   [ "${running:-0}" -gt 0 ] || _stack_up
   cmd_db setdev "$wt" >/dev/null
   local app nx
-  for app in web dashboard; do
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
     nx="$wt/apps/$app/.next"
     if [ -d "$nx" ] && grep -rqlF "$PROD_PROJECT_REF" "$nx/static" 2>/dev/null; then
       log "dropping stale $app/.next (prod URL was baked into the bundle)"; rm -rf "$nx"
     fi
-  done
+  done < <(_apps_with_env "$wt")
   log "$(basename "$wt") → LOCAL db up + env pointed local + stale bundle dropped."
   echo "  now start the app yourself:  cd $wt/apps/web && pnpm dev"
 }
