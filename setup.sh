@@ -43,6 +43,16 @@ _persist() {  # _persist VAR value — append/replace VAR=value in config.sh
     && sed -i '' -E "s#^${var}=.*#${var}=\"${val}\"#" config.sh \
     || printf '\n%s="%s"\n' "$var" "$val" >> config.sh
 }
+# `read` does NOT perform tilde expansion — a typed "~/code/..." stays a literal
+# tilde character, so a later `[ -d "$val/..." ]` check fails against a path
+# that doesn't exist. Expand it ourselves before validating/using the answer.
+_expand_tilde() {
+  case "$1" in
+    "~")   printf '%s' "$HOME" ;;
+    "~/"*) printf '%s' "$HOME/${1#\~/}" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
 
 if [ ! -d "${AVOCA_NEXT_DIR:-}/packages/db/migrations" ]; then
   # avoca-local-db and avoca-next are conventionally siblings under one parent
@@ -53,6 +63,7 @@ if [ ! -d "${AVOCA_NEXT_DIR:-}/packages/db/migrations" ]; then
   if [ -t 0 ]; then
     printf '  Where is your avoca-next clone? [%s]: ' "$GUESS" >&2
     read -r ans
+    ans="$(_expand_tilde "$ans")"
     AVOCA_NEXT_DIR="${ans:-$GUESS}"
     [ -d "$AVOCA_NEXT_DIR/packages/db/migrations" ] \
       || die "still not an avoca-next clone (no packages/db/migrations) at $AVOCA_NEXT_DIR"
@@ -69,13 +80,20 @@ if [ ! -d "${AVOCA_NEXT_DIR:-}/packages/db/migrations" ]; then
 fi
 ok "avoca-next: $AVOCA_NEXT_DIR"
 
-if [ -z "${WORKTREES_DIR:-}" ]; then
+if [ -z "${WORKTREES_DIR:-}" ] || [ ! -d "${WORKTREES_DIR:-}" ]; then
+  # NOT just an emptiness check: config.example.sh's own conditional default
+  # (: "${WORKTREES_DIR:=$HOME/code/avoca-next.worktrees}") already fills this
+  # in as non-empty the moment config.sh is sourced — a bare -z check trivially
+  # passes and the prompt never fires, even though that default path doesn't
+  # exist on a workbench-shaped machine. Also require the directory to exist.
+  #
   # The natural default for a workbench-shaped checkout: wherever you invoked
   # this script from is where your worktrees live as siblings.
   GUESS="$INVOKED_FROM"
   if [ -t 0 ]; then
     printf '  Where do your worktrees live? [%s]: ' "$GUESS" >&2
     read -r ans
+    ans="$(_expand_tilde "$ans")"
     WORKTREES_DIR="${ans:-$GUESS}"
     _persist WORKTREES_DIR "$WORKTREES_DIR"
   else
