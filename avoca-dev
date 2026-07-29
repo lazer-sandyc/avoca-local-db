@@ -342,11 +342,14 @@ SQL
 # duplicate-bp <blueprint_id>: copy a modular blueprint (+ its versions and
 # assistant variables) from prod so the builder / clone-from-template works.
 cmd_duplicate_bp() {
-  local id="${1:?usage: avoca-dev duplicate-bp <blueprint_id>}"
+  local id="${1:?usage: avoca-dev duplicate-bp <blueprint_id> [--staging]}"
+  # Cloning commands default to PRODUCTION, not the global SOURCE_DB default (staging) —
+  # see cmd_duplicate_team for the full rationale. --staging is the rare opt-out.
+  [ "${2:-}" = --staging ] || SOURCE_DB=production
   need psql
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.multi_agent_blueprints where id='$id'" 2>/dev/null | tr -d ' ')"
-  [ -n "$name" ] || die "no blueprint '$id' in prod"
+  [ -n "$name" ] || die "no blueprint '$id' in $SOURCE_DB"
   log "duplicate blueprint '$id' from $SOURCE_DB (READ-ONLY)"
   # idempotent: drop any prior copy first (FK triggers off, so order is free)
   lsql -q >/dev/null 2>&1 <<SQL
@@ -419,28 +422,35 @@ cmd_delete_team() {
 # the synthetic seed owner/enterprise so no owner PII is copied. Referenced
 # modular blueprints are auto-pulled. Idempotent (drops any prior copy first).
 cmd_duplicate_team() {
-  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls | --yes]}"; shift || true
-  # By DEFAULT we also import the team's last week of real calls. This only yields data
-  # when SOURCE_DB=production (calls live in prod; staging is call-empty), so it's a
-  # harmless no-op on the default staging source. --no-calls = config only (no call PII).
-  local calls_since=7 calls_limit="" calls_off="" force_dup=""
+  local team="${1:?usage: avoca-dev duplicate-team <team_id> [--with-calls [--since <days> | --limit <n>] | --staging | --yes]}"; shift || true
+  # By DEFAULT we do NOT import calls — they're real, PII-bearing content, so pulling
+  # them is opt-in (--with-calls / --with-calls=<limit> / --since / --limit all opt in).
+  # --no-calls is still accepted as a no-op alias since that's already the default.
+  local calls_since=7 calls_limit="" calls_off=1 force_dup="" use_staging=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes|-y|--force) force_dup=1; shift;;
-      --no-calls)     calls_off=1; shift;;
-      --with-calls)   shift;;                       # accepted alias — default is already on
-      --with-calls=*) calls_limit="${1#*=}"; shift;;
-      --since)        calls_since="${2:?--since needs a number of days}"; shift 2;;
-      --since=*)      calls_since="${1#*=}"; shift;;
-      --limit)        calls_limit="${2:?--limit needs a number}"; shift 2;;
-      --limit=*)      calls_limit="${1#*=}"; shift;;
-      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--since <days> | --limit <n> | --no-calls | --yes])";;
+      --staging)      use_staging=1; shift;;
+      --no-calls)     shift;;                       # accepted alias — default is already off
+      --with-calls)   calls_off=""; shift;;
+      --with-calls=*) calls_off=""; calls_limit="${1#*=}"; shift;;
+      --since)        calls_off=""; calls_since="${2:?--since needs a number of days}"; shift 2;;
+      --since=*)      calls_off=""; calls_since="${1#*=}"; shift;;
+      --limit)        calls_off=""; calls_limit="${2:?--limit needs a number}"; shift 2;;
+      --limit=*)      calls_off=""; calls_limit="${1#*=}"; shift;;
+      *) die "unknown arg: $1 (usage: duplicate-team <team_id> [--with-calls [--since <days> | --limit <n>] | --staging | --yes])";;
     esac
   done
   need psql
+  # Cloning commands default to PRODUCTION, not the global SOURCE_DB default (staging) —
+  # real customer teams/blueprints/calls are rarely on staging, so staging-first was just
+  # a wasted round-trip before an inevitable fallback. --staging is the explicit, rare
+  # opt-out. This is scoped to the clone commands only — setup/reference/etc. stay
+  # staging-first by design, unaffected.
+  [ -n "$use_staging" ] || SOURCE_DB=production
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
-  [ -n "$name" ] || die "no team $team in prod"
+  [ -n "$name" ] || die "no team $team in $SOURCE_DB"
   local src_ent; src_ent="$(_src_psql "$url" -tAqc "select enterprise_id from public.teams where id=$team" 2>/dev/null | tr -d '[:space:]')"
   _ensure_synthetic_owner   # create the synthetic owner/enterprise if missing (no 'seed' prereq)
   log "duplicate team $team ('$name') from $SOURCE_DB (READ-ONLY; config only; provider handles scrubbed)"
@@ -579,25 +589,30 @@ SQL
 # Idempotent: replaces this team's imported call rows each run. Default: newest 50 calls.
 # Calls live in prod, so run: SOURCE_DB=production avoca-dev dup-calls <id>
 cmd_dup_calls() {
-  local team="${1:?usage: avoca-dev dup-calls <team_id> [--since <days> | --limit <n>]}"; shift || true
+  local team="${1:?usage: avoca-dev dup-calls <team_id> [--since <days> | --limit <n> | --staging]}"; shift || true
   need psql
-  local since_days="" limit_n=""
+  local since_days="" limit_n="" use_staging=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --since)   since_days="${2:?--since needs a number of days}"; shift 2;;
       --since=*) since_days="${1#*=}"; shift;;
       --limit)   limit_n="${2:?--limit needs a number}"; shift 2;;
       --limit=*) limit_n="${1#*=}"; shift;;
-      *) die "unknown arg: $1 (usage: dup-calls <team_id> [--since <days> | --limit <n>])";;
+      --staging) use_staging=1; shift;;
+      *) die "unknown arg: $1 (usage: dup-calls <team_id> [--since <days> | --limit <n> | --staging])";;
     esac
   done
   [ -n "$since_days" ] && [ -n "$limit_n" ] && die "use --since OR --limit, not both"
   [ -n "$since_days$limit_n" ] || since_days=7   # default: last week of calls
   case "$since_days$limit_n" in *[!0-9]*) die "--since/--limit take a plain number";; esac
 
+  # Cloning commands default to PRODUCTION, not the global SOURCE_DB default (staging) —
+  # calls live in prod; staging is call-empty. See cmd_duplicate_team for the full
+  # rationale. --staging is the rare opt-out.
+  [ -n "$use_staging" ] || SOURCE_DB=production
   local url; url="$(_source_url)"
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
-  [ -n "$name" ] || die "no team $team in $SOURCE_DB (calls live in prod — try SOURCE_DB=production)"
+  [ -n "$name" ] || die "no team $team in $SOURCE_DB"
   [ -n "$(lsql -tAc "select 1 from teams where id=$team" 2>/dev/null)" ] \
     || die "team $team isn't in local yet — run 'SOURCE_DB=$SOURCE_DB avoca-dev duplicate-team $team' first (calls FK to teams)"
 
