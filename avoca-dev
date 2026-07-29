@@ -125,6 +125,7 @@ cmd_setup() {
   IFS=',' read -ra SCHEMAS <<< "$APP_SCHEMAS"
   local N=8
 
+  _prompt_login_identity    # ask, don't assume — up front, before the long-running stages, not buried at the end
   stage 1 $N "Standing up local Supabase"
   mkdir -p "$LOCAL_DB_DIR"
   [ -f "$LOCAL_DB_DIR/supabase/config.toml" ] || ( cd "$LOCAL_DB_DIR" && yes n | supabase init >/dev/null 2>&1 || true )
@@ -180,7 +181,6 @@ SQL
   stage 7 $N "Setting up auth"
   _ensure_synthetic_owner   # synthetic owner/enterprise so duplicate-team works out of the box (NOT the Test Auto teams)
   stage 8 $N "Adding login user"
-  _prompt_login_identity    # ask, don't assume — config.sh/default values are just the accept-with-Enter suggestion
   _seed_login               # local login user
   echo ""
   log "setup done. Log in as $LOGIN_EMAIL, and clone a real team: SOURCE_DB=production avoca-dev duplicate-team <id>"
