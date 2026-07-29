@@ -6,7 +6,10 @@
 # shared staging DB. Checks prerequisites, wires config, verifies your staging
 # creds, then builds the local DB. Safe to re-run.
 set -euo pipefail
+INVOKED_FROM="$PWD"   # capture BEFORE the cd below — the natural WORKTREES_DIR default
+                      # for a workbench-shaped checkout (worktrees live where you invoked this from)
 cd "$(dirname "${BASH_SOURCE[0]}")"
+SELF_REAL_DIR="$(pwd -P)"   # symlink-resolved: avoca-local-db's real, non-workbench location
 
 say()  { printf '\n\033[1m▸ %s\033[0m\n' "$*"; }
 ok()   { echo "  ✓ $*"; }
@@ -24,25 +27,62 @@ for c in docker supabase psql pg_dump; do
 done
 
 say "2/4  config"
-if [ ! -f config.sh ]; then
-  cp config.example.sh config.sh
-  cat >&2 <<'EOF'
-  Created config.sh — your per-machine settings (gitignored, safe to edit).
-
-  ► Open config.sh and set your paths, then re-run ./setup.sh:
-      AVOCA_NEXT_DIR  — the absolute path to your avoca-next clone
-      WORKTREES_DIR   — where your avoca-next worktrees live
-    (Everything else has a sensible default; the local stack lives in THIS repo.)
-EOF
-  exit 0
-fi
-ok "config.sh present"
+[ -f config.sh ] || { cp config.example.sh config.sh; ok "created config.sh (gitignored, per-machine)"; }
 # shellcheck disable=SC1091
 . ./config.sh 2>/dev/null || true
-: "${AVOCA_NEXT_DIR:=$HOME/code/avoca-next}"
-[ -d "$AVOCA_NEXT_DIR/packages/db/migrations" ] \
-  || die "AVOCA_NEXT_DIR ($AVOCA_NEXT_DIR) isn't an avoca-next clone (no packages/db/migrations) — set it in config.sh and re-run"
+
+# Two paths are genuinely per-machine and can't ship with a working default:
+#   AVOCA_NEXT_DIR  — your avoca-next clone (needs packages/db/migrations)
+#   WORKTREES_DIR   — where your worktrees live (so `db setdev <slug>` can find one)
+# Ask for them interactively instead of erroring out and making you edit a file +
+# re-run. Each prompt offers an auto-detected guess — press Enter to accept it.
+
+_persist() {  # _persist VAR value — append/replace VAR=value in config.sh
+  local var="$1" val="$2"
+  grep -qE "^${var}=" config.sh 2>/dev/null \
+    && sed -i '' -E "s#^${var}=.*#${var}=\"${val}\"#" config.sh \
+    || printf '\n%s="%s"\n' "$var" "$val" >> config.sh
+}
+
+if [ ! -d "${AVOCA_NEXT_DIR:-}/packages/db/migrations" ]; then
+  # avoca-local-db and avoca-next are conventionally siblings under one parent
+  # (…/avoca/avoca-next-workbench, …/avoca/avoca-next, …/avoca/avoca-local-db) —
+  # so check the sibling of THIS script's own real location first.
+  GUESS="$(dirname "$SELF_REAL_DIR")/avoca-next"
+  [ -d "$GUESS/packages/db/migrations" ] || GUESS="${AVOCA_NEXT_DIR:-$HOME/code/avoca-next}"
+  if [ -t 0 ]; then
+    printf '  Where is your avoca-next clone? [%s]: ' "$GUESS" >&2
+    read -r ans
+    AVOCA_NEXT_DIR="${ans:-$GUESS}"
+    [ -d "$AVOCA_NEXT_DIR/packages/db/migrations" ] \
+      || die "still not an avoca-next clone (no packages/db/migrations) at $AVOCA_NEXT_DIR"
+    _persist AVOCA_NEXT_DIR "$AVOCA_NEXT_DIR"
+  elif [ -d "$GUESS/packages/db/migrations" ]; then
+    # No TTY to confirm with (e.g. piped/non-interactive), but the sibling
+    # auto-detect itself already found a valid clone — use it rather than
+    # dying on a guess that was actually correct.
+    AVOCA_NEXT_DIR="$GUESS"
+    _persist AVOCA_NEXT_DIR "$AVOCA_NEXT_DIR"
+  else
+    die "AVOCA_NEXT_DIR ($GUESS) isn't an avoca-next clone (no packages/db/migrations) — set it in config.sh and re-run (no TTY to prompt on)"
+  fi
+fi
 ok "avoca-next: $AVOCA_NEXT_DIR"
+
+if [ -z "${WORKTREES_DIR:-}" ]; then
+  # The natural default for a workbench-shaped checkout: wherever you invoked
+  # this script from is where your worktrees live as siblings.
+  GUESS="$INVOKED_FROM"
+  if [ -t 0 ]; then
+    printf '  Where do your worktrees live? [%s]: ' "$GUESS" >&2
+    read -r ans
+    WORKTREES_DIR="${ans:-$GUESS}"
+    _persist WORKTREES_DIR "$WORKTREES_DIR"
+  else
+    WORKTREES_DIR="$GUESS"
+  fi
+fi
+ok "worktrees: $WORKTREES_DIR"
 
 say "3/4  staging credentials"
 CREDS="${AVOCA_CREDS_FILE:-$HOME/.avoca/postgres.env}"
