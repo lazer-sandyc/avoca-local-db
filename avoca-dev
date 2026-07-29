@@ -75,6 +75,13 @@ SYNC_CORE="voices,llm_models,transcribers,feature_flags,test_suite_templates,tes
 
 die() { echo "avoca-dev: $*" >&2; exit 1; }
 log() { echo "▸ $*"; }
+# A numbered, human-narratable stage header for long-running multi-step commands
+# (setup, duplicate-team, ...) — so someone watching stdout live can say "okay,
+# right now it's doing X" without reading docker/SQL noise. The technical detail
+# for that stage (row counts, table names, docker output) still prints
+# underneath via the normal log()/echo lines — this only marks where one stage
+# ends and the next begins. Usage: stage <n> <total> "Present-tense description".
+stage() { echo ""; echo "── [$1/$2] $3"; }
 need() {
   command -v "$1" >/dev/null 2>&1 && return
   case "$1" in
@@ -106,7 +113,7 @@ resolve_worktree() {
 # LOCAL / prod / - for a given .env.local (by its effective NEXT_PUBLIC_SUPABASE_URL)
 ptr_tag() {
   local f="$1"; [ -f "$f" ] || { echo "-"; return; }
-  local u; u="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+  local u; u="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')" || true
   case "$u" in *127.0.0.1*|*localhost*) echo LOCAL;; "" ) echo "-";; *) echo prod;; esac
 }
 
@@ -116,15 +123,17 @@ ptr_tag() {
 cmd_setup() {
   need supabase; need psql; need pg_dump
   IFS=',' read -ra SCHEMAS <<< "$APP_SCHEMAS"
+  local N=8
 
-  log "supabase stack in $LOCAL_DB_DIR"
+  stage 1 $N "Standing up local Supabase"
   mkdir -p "$LOCAL_DB_DIR"
   [ -f "$LOCAL_DB_DIR/supabase/config.toml" ] || ( cd "$LOCAL_DB_DIR" && yes n | supabase init >/dev/null 2>&1 || true )
   ( cd "$LOCAL_DB_DIR" && supabase start ${SUPABASE_EXCLUDE:+-x "$SUPABASE_EXCLUDE"} ) || die "supabase start failed (try 'supabase start --debug' in $LOCAL_DB_DIR; or widen SUPABASE_EXCLUDE)"
 
+  stage 2 $N "Snapshotting staging schema"
   local existing; existing="$(lsql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo 0)"
   if [ "${existing:-0}" -gt 0 ]; then
-    log "schema already loaded ($existing public tables); skipping load (use 'avoca-dev reset' to rebuild)"
+    log "already loaded ($existing public tables) — skipping (use 'avoca-dev reset' to rebuild)"
   else
     local src_url; src_url="$(_source_url)"   # session endpoint + hardened via _src_pgdump
     lsql -q -c "DROP SCHEMA IF EXISTS public CASCADE; $(for s in "${SCHEMAS[@]}"; do [ "$s" = public ] || echo "DROP SCHEMA IF EXISTS $s CASCADE;"; done) CREATE SCHEMA public;"
@@ -134,7 +143,7 @@ cmd_setup() {
     case "$SOURCE_DB" in
       production|prod)
         # PROD: schema-only (prod data is huge + PII). Reference/config come via cmd_reference / duplicate-team.
-        log "load prod SCHEMA only (READ-ONLY; prod data is huge + has PII)"
+        log "reading prod SCHEMA only (READ-ONLY; prod data is huge + has PII)"
         _src_pgdump "$src_url" --schema-only --no-owner --no-privileges "${args[@]}" \
           | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
         lsql -v ON_ERROR_STOP=0 -q -f "$tmp" 2>&1 | grep -iE 'error' | grep -viE 'already exists' | head -20 || true
@@ -145,7 +154,7 @@ cmd_setup() {
         # clone them. Load with FK triggers OFF (session_replication_role=replica) so insert
         # order and cross-schema FKs (e.g. public.profiles -> auth.users, which we don't copy)
         # never block the restore.
-        log "snapshot $SOURCE_DB (schema + data, READ-ONLY) — app schemas only (~tens of MB, no PII)"
+        log "reading $SOURCE_DB (schema + data, READ-ONLY) — app schemas only (~tens of MB, no PII)"
         _src_pgdump "$src_url" --no-owner --no-privileges "${args[@]}" \
           | grep -viE '^SET transaction_timeout' | grep -viE '^CREATE SCHEMA public;' > "$tmp"
         lsql -v ON_ERROR_STOP=0 -q >/dev/null 2>&1 <<SQL || true
@@ -160,12 +169,19 @@ SQL
     log "loaded $loaded public tables"
   fi
 
+  stage 3 $N "Setting up grants"
   cmd_grants
+  stage 4 $N "Migrating ledger"
   cmd_ledger
+  stage 5 $N "Seeding reference data"
   cmd_reference             # sync global prod config (lookups + feature flags + sim-v2 test suites) so local matches production
+  stage 6 $N "Seeding shared variables"
   _seed_global_variables    # global assistant_variables module library (transfer gating, language mode, speaking style)
+  stage 7 $N "Setting up auth"
   _ensure_synthetic_owner   # synthetic owner/enterprise so duplicate-team works out of the box (NOT the Test Auto teams)
+  stage 8 $N "Adding login user"
   _seed_login               # local login user
+  echo ""
   log "setup done. Log in as $LOGIN_EMAIL, and clone a real team: SOURCE_DB=production avoca-dev duplicate-team <id>"
   log "  run your app: avoca-dev db setdev <worktree> then your normal pnpm dev.  (synthetic transfer test teams: avoca-dev seed)"
 }
@@ -212,7 +228,7 @@ _source_url() {
   if [ -f "$AVOCA_CREDS_FILE" ] && grep -qE "^$key=" "$AVOCA_CREDS_FILE"; then
     u="$(grep -E "^$key=" "$AVOCA_CREDS_FILE" | tail -1 | cut -d= -f2- | tr -d '"')"
   elif [ "$SOURCE_DB" = production ] || [ "$SOURCE_DB" = prod ]; then
-    u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"  # legacy fallback
+    u="$(grep -E '^(POSTGRES_URL|PROD_URL)=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')" || true  # legacy fallback
   fi
   [ -n "${u:-}" ] || die "no $key in $AVOCA_CREDS_FILE — paste your creds there (1Password), or run with SOURCE_DB=production"
   printf '%s\n' "$(printf '%s' "$u" | sed -E 's#:6543/#:5432/#')"
@@ -832,7 +848,7 @@ _db_verify_worktree() {
     [ -n "$app" ] || continue
     f="$wt/apps/$app/.env.local"
     for v in POSTGRES_URL POSTGRES_HOST NEXT_PUBLIC_SUPABASE_URL SUPABASE_URL; do
-      val="$(grep -E "^${v}=" "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+      val="$(grep -E "^${v}=" "$f" | tail -1 | cut -d= -f2- | tr -d '"')" || true
       [ -n "$val" ] || continue
       case "$val" in
         *127.0.0.1*|*localhost*) : ;;
@@ -880,7 +896,7 @@ cmd_db() {
     while IFS= read -r app; do
       [ -n "$app" ] || continue
       f="$wt/apps/$app/.env.local"
-      url="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')"
+      url="$(grep -E '^NEXT_PUBLIC_SUPABASE_URL=' "$f" | tail -1 | cut -d= -f2- | tr -d '"')" || true
       case "$url" in *127.0.0.1*|*localhost*) tag="LOCAL";; *) tag="prod ";; esac
       echo "  apps/$app: $tag  (supabase=${url:-none})"
     done <<< "$apps"
@@ -1024,14 +1040,14 @@ FN_PREFIX="avoca-dev-local"
 _twilio_creds() {
   need python3
   local f="$PROD_ENV_FILE"
-  ISV_SID="$(grep -E '^TWILIO_ISV_ACCOUNT_SID=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
-  ISV_TOK="$(grep -E '^TWILIO_ISV_AUTH_TOKEN=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  ISV_SID="$(grep -E '^TWILIO_ISV_ACCOUNT_SID=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')" || true
+  ISV_TOK="$(grep -E '^TWILIO_ISV_AUTH_TOKEN=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')" || true
   [ -n "$ISV_SID" ] && [ -n "$ISV_TOK" ] || die "no TWILIO_ISV_ACCOUNT_SID/AUTH_TOKEN in $f (run 'vercel env pull' there)"
 }
 # Non-fatal creds load (returns 1 instead of dying) — used by seed's best-effort provisioning.
 _twilio_creds_soft() {
-  ISV_SID="$(grep -E '^TWILIO_ISV_ACCOUNT_SID=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
-  ISV_TOK="$(grep -E '^TWILIO_ISV_AUTH_TOKEN=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  ISV_SID="$(grep -E '^TWILIO_ISV_ACCOUNT_SID=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')" || true
+  ISV_TOK="$(grep -E '^TWILIO_ISV_AUTH_TOKEN=' "$PROD_ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')" || true
   [ -n "$ISV_SID" ] && [ -n "$ISV_TOK" ]
 }
 _tw() { curl -s -u "$ISV_SID:$ISV_TOK" "$@"; }               # authed as ISV master
