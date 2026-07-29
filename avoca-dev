@@ -717,12 +717,23 @@ SQL
 _prompt_login_identity() {
   [ -t 0 ] || { log "non-interactive shell — using LOGIN_EMAIL/LOGIN_PASSWORD/LOGIN_NAME as configured"; return; }
   local reply
+  # Two separate `set -e` traps, not one:
+  #  1. `read` returns non-zero on EOF (Ctrl-D, closed/backgrounded stdin) — `|| reply=""`
+  #     degrades to the existing default instead of crashing.
+  #  2. `[ -n "$reply" ] && VAR="$reply"` as a bare statement: a failing AND-list is only
+  #     exempt from `set -e` when it ISN'T the last command executed in the function. Name
+  #     is the last prompt here, so simply pressing Enter to accept its default (empty
+  #     reply -> failing test -> function's own return status is non-zero) killed the whole
+  #     script the moment `_prompt_login_identity` returned to cmd_setup's bare call site —
+  #     email/password looked fine only because they aren't last. `[ -z ] || VAR=` makes one
+  #     branch always succeed regardless of position, so this can't recur for any of the three.
   printf "  Login email [%s]: " "$LOGIN_EMAIL" >&2
-  read -r reply; [ -n "$reply" ] && LOGIN_EMAIL="$reply"
+  read -r reply || reply=""; [ -z "$reply" ] || LOGIN_EMAIL="$reply"
   printf "  Login password [%s]: " "$LOGIN_PASSWORD" >&2
-  read -r reply; [ -n "$reply" ] && LOGIN_PASSWORD="$reply"
+  read -r reply || reply=""; [ -z "$reply" ] || LOGIN_PASSWORD="$reply"
   printf "  Login name [%s]: " "$LOGIN_NAME" >&2
-  read -r reply; [ -n "$reply" ] && LOGIN_NAME="$reply"
+  read -r reply || reply=""; [ -z "$reply" ] || LOGIN_NAME="$reply"
+  return 0
 }
 
 # Create a LOCAL login user (auth.users + identity + profile) so you can sign in.
@@ -1086,6 +1097,11 @@ _tw_provision() {
   [ -n "$ids" ] || { echo "every local team already has a subaccount — nothing to provision"; return 0; }
   echo "provisioning subaccounts for local teams without one…"
   while read -r id; do [ -n "$id" ] && _tw_provision_one "$id"; done <<< "$ids"
+  # A trailing empty read from `<<<`'s appended newline makes the loop's own exit status
+  # (= its last iteration's) non-zero — since this is the function's last statement, that
+  # would otherwise become _tw_provision's return status and spuriously signal failure
+  # even though every real team was processed fine. Force success explicitly.
+  return 0
 }
 _tw_provision_one() {
   local team="$1"
@@ -1109,6 +1125,8 @@ _tw_deprovision() {
   [ -n "$ids" ] || { echo "no subaccounts recorded — nothing to deprovision"; return 0; }
   echo "reclaiming all local subaccounts (tag-gated on '$FN_PREFIX')…"
   while read -r id; do [ -n "$id" ] && _tw_deprovision_one "$id"; done <<< "$ids"
+  # Same trailing-empty-read issue as _tw_provision — force success explicitly.
+  return 0
 }
 _tw_deprovision_one() {
   local team="$1"

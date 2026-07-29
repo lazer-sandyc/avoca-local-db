@@ -37,11 +37,22 @@ say "2/4  config"
 # Ask for them interactively instead of erroring out and making you edit a file +
 # re-run. Each prompt offers an auto-detected guess — press Enter to accept it.
 
-_persist() {  # _persist VAR value — append/replace VAR=value in config.sh
+_persist() {  # _persist VAR value — replace an existing override or append.
   local var="$1" val="$2"
-  grep -qE "^${var}=" config.sh 2>/dev/null \
-    && sed -i '' -E "s#^${var}=.*#${var}=\"${val}\"#" config.sh \
-    || printf '\n%s="%s"\n' "$var" "$val" >> config.sh
+  if grep -qE "^${var}=" config.sh 2>/dev/null; then
+    sed -i '' -E "s#^${var}=.*#${var}=\"${val}\"#" config.sh
+  elif grep -qE '^: "\$\{'"${var}"':=' config.sh 2>/dev/null; then
+    # Replace the templated `: "${VAR:=default}"` line IN PLACE rather than
+    # appending a new override at the bottom of the file. Sourcing runs
+    # top-to-bottom, so an override appended after this point arrives too late
+    # for any OTHER config.sh default computed via `:=` from this var earlier
+    # in the file (e.g. PROD_ENV_FILE derives from AVOCA_NEXT_DIR) — that
+    # default would lock in the template's stale value before the real
+    # override ever took effect.
+    sed -i '' -E 's#^: "\$\{'"${var}"':=.*#'"${var}"'="'"${val}"'"#' config.sh
+  else
+    printf '\n%s="%s"\n' "$var" "$val" >> config.sh
+  fi
 }
 # `read` does NOT perform tilde expansion — a typed "~/code/..." stays a literal
 # tilde character, so a later `[ -d "$val/..." ]` check fails against a path
