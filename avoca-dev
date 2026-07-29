@@ -589,21 +589,27 @@ SQL
 # Idempotent: replaces this team's imported call rows each run. Default: newest 50 calls.
 # Calls live in prod, so run: SOURCE_DB=production avoca-dev dup-calls <id>
 cmd_dup_calls() {
-  local team="${1:?usage: avoca-dev dup-calls <team_id> [--since <days> | --limit <n> | --staging]}"; shift || true
   need psql
-  local since_days="" limit_n="" use_staging=""
+  local team="" call_id="" since_days="" limit_n="" use_staging=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --since)   since_days="${2:?--since needs a number of days}"; shift 2;;
-      --since=*) since_days="${1#*=}"; shift;;
-      --limit)   limit_n="${2:?--limit needs a number}"; shift 2;;
-      --limit=*) limit_n="${1#*=}"; shift;;
-      --staging) use_staging=1; shift;;
-      *) die "unknown arg: $1 (usage: dup-calls <team_id> [--since <days> | --limit <n> | --staging])";;
+      --call-id)   call_id="${2:?--call-id needs a call id}"; shift 2;;
+      --call-id=*) call_id="${1#*=}"; shift;;
+      --since)     since_days="${2:?--since needs a number of days}"; shift 2;;
+      --since=*)   since_days="${1#*=}"; shift;;
+      --limit)     limit_n="${2:?--limit needs a number}"; shift 2;;
+      --limit=*)   limit_n="${1#*=}"; shift;;
+      --staging)   use_staging=1; shift;;
+      --*) die "unknown arg: $1 (usage: dup-calls <team_id> [--since <days> | --limit <n> | --staging] | dup-calls --call-id <call_id> [--staging])";;
+      *) [ -z "$team" ] || die "unexpected extra arg: $1"; team="$1"; shift;;
     esac
   done
+  [ -n "$team" ] || [ -n "$call_id" ] \
+    || die "usage: dup-calls <team_id> [--since <days> | --limit <n> | --staging] | dup-calls --call-id <call_id> [--staging]"
+  [ -z "$team" ] || [ -z "$call_id" ] || die "pass either <team_id> or --call-id, not both"
+  [ -z "$call_id" ] || [ -z "$since_days$limit_n" ] || die "--call-id is a single call — don't combine it with --since/--limit"
   [ -n "$since_days" ] && [ -n "$limit_n" ] && die "use --since OR --limit, not both"
-  [ -n "$since_days$limit_n" ] || since_days=7   # default: last week of calls
+  [ -n "$call_id" ] || [ -n "$since_days$limit_n" ] || since_days=7   # default: last week of calls
   case "$since_days$limit_n" in *[!0-9]*) die "--since/--limit take a plain number";; esac
 
   # Cloning commands default to PRODUCTION, not the global SOURCE_DB default (staging) —
@@ -611,14 +617,38 @@ cmd_dup_calls() {
   # rationale. --staging is the rare opt-out.
   [ -n "$use_staging" ] || SOURCE_DB=production
   local url; url="$(_source_url)"
+
+  if [ -n "$call_id" ]; then
+    # --call-id doesn't require knowing the team up front — resolve it from the call
+    # itself, so "I have a call id, I don't know/care what team it's on" just works.
+    team="$(_src_psql "$url" -tAqc "select team_id from public.calls where id='$call_id'" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$team" ] || die "no call $call_id in $SOURCE_DB"
+  fi
+
   local name; name="$(_src_psql "$url" -tAqc "select name from public.teams where id=$team" 2>/dev/null | sed 's/^ *//;s/ *$//')"
   [ -n "$name" ] || die "no team $team in $SOURCE_DB"
-  [ -n "$(lsql -tAc "select 1 from teams where id=$team" 2>/dev/null)" ] \
-    || die "team $team isn't in local yet — run 'SOURCE_DB=$SOURCE_DB avoca-dev duplicate-team $team' first (calls FK to teams)"
 
-  # source-side selector for THIS team's calls, bounded by window or count
+  if [ -z "$(lsql -tAc "select 1 from teams where id=$team" 2>/dev/null)" ]; then
+    # Team isn't local yet. With --call-id you may not have known the team_id at all
+    # until just now, so offer to clone it instead of just dying with instructions.
+    if [ -t 0 ]; then
+      printf "  Team %s ('%s') isn't in your local DB yet. Clone it now? [y/N] " "$team" "$name" >&2
+      local reply; read -r reply || reply=""
+      case "$reply" in
+        y|Y|yes|YES) cmd_duplicate_team "$team" --yes ;;
+        *) die "aborted — team $team left uncloned, so its calls can't be imported" ;;
+      esac
+    else
+      die "team $team isn't in local yet — run 'SOURCE_DB=$SOURCE_DB avoca-dev duplicate-team $team' first (calls FK to teams) (no TTY to prompt on)"
+    fi
+  fi
+
+  # source-side selector for THIS team's calls, bounded by window, count, or one call id
   local sel
-  if [ -n "$limit_n" ]; then
+  if [ -n "$call_id" ]; then
+    sel="team_id=$team and id='$call_id'"
+    log "dup-calls team $team ('$name') from $SOURCE_DB — single call $call_id (READ-ONLY)"
+  elif [ -n "$limit_n" ]; then
     sel="team_id=$team and id in (select id from public.calls where team_id=$team order by created_at desc nulls last limit $limit_n)"
     log "dup-calls team $team ('$name') from $SOURCE_DB — newest $limit_n calls (READ-ONLY)"
   else
@@ -627,8 +657,20 @@ cmd_dup_calls() {
   fi
   local callsub="select id from public.calls where $sel"
 
-  # idempotent: clear this team's previously-imported call rows (children first; replica => order-free)
-  lsql -q >/dev/null 2>&1 <<SQL
+  # idempotent: clear previously-imported rows in scope (children first; replica =>
+  # order-free). --call-id is ADDITIVE — only that one call's rows are cleared/
+  # replaced, leaving whatever else is already local for this team untouched.
+  # --since/--limit stay a full-team reset, matching existing behavior.
+  if [ -n "$call_id" ]; then
+    lsql -q >/dev/null 2>&1 <<SQL
+set session_replication_role = replica;
+delete from public.transfer_destination_logs where source_call_id in ($callsub) or received_call_id in ($callsub);
+delete from public.call_conversations where call_id in ($callsub);
+delete from public.call_analysis      where call_id in ($callsub);
+delete from public.calls              where id in ($callsub);
+SQL
+  else
+    lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
 delete from public.transfer_destination_logs where source_call_id in (select id from public.calls where team_id=$team) or received_call_id in (select id from public.calls where team_id=$team);
 delete from public.call_conversations where call_id in (select id from public.calls where team_id=$team);
@@ -636,6 +678,7 @@ delete from public.call_analysis      where call_id in (select id from public.ca
 delete from public.calls              where team_id=$team;
 delete from public.call_flows         where team_id=$team;
 SQL
+  fi
 
   # parents first (logging only; replica role makes FK order irrelevant)
   _pull "$url" call_flows "team_id=$team and id in (select call_flow_id from public.calls where $sel and call_flow_id is not null)"
