@@ -180,6 +180,7 @@ SQL
   stage 7 $N "Setting up auth"
   _ensure_synthetic_owner   # synthetic owner/enterprise so duplicate-team works out of the box (NOT the Test Auto teams)
   stage 8 $N "Adding login user"
+  _prompt_login_identity    # ask, don't assume — config.sh/default values are just the accept-with-Enter suggestion
   _seed_login               # local login user
   echo ""
   log "setup done. Log in as $LOGIN_EMAIL, and clone a real team: SOURCE_DB=production avoca-dev duplicate-team <id>"
@@ -708,6 +709,20 @@ INSERT INTO enterprises (id, name) VALUES ($SEED_ENTERPRISE_ID, 'Lazer Test Ente
 INSERT INTO auth.users (id) VALUES ('$SEED_OWNER_ID') ON CONFLICT (id) DO NOTHING;
 INSERT INTO profiles (id, email) VALUES ('$SEED_OWNER_ID', 'test-owner@lazer.local') ON CONFLICT (id) DO NOTHING;
 SQL
+}
+
+# Ask for the local login user's email/password/name — TTY-only, config.sh's
+# values (or their hardcoded defaults) shown as the accept-with-Enter suggestion.
+# Non-interactive shells (CI, scripted calls) skip straight to those values.
+_prompt_login_identity() {
+  [ -t 0 ] || { log "non-interactive shell — using LOGIN_EMAIL/LOGIN_PASSWORD/LOGIN_NAME as configured"; return; }
+  local reply
+  printf "  Login email [%s]: " "$LOGIN_EMAIL" >&2
+  read -r reply; [ -n "$reply" ] && LOGIN_EMAIL="$reply"
+  printf "  Login password [%s]: " "$LOGIN_PASSWORD" >&2
+  read -r reply; [ -n "$reply" ] && LOGIN_PASSWORD="$reply"
+  printf "  Login name [%s]: " "$LOGIN_NAME" >&2
+  read -r reply; [ -n "$reply" ] && LOGIN_NAME="$reply"
 }
 
 # Create a LOCAL login user (auth.users + identity + profile) so you can sign in.
