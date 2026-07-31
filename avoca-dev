@@ -581,7 +581,7 @@ SQL
 }
 
 # dup-calls <team_id> [--since <days> | --limit <n>]: copy a BOUNDED slice of a team's
-# real call history (calls + call_flows + transcripts/analysis + transfer notes) from the
+# real call history (calls + call_flows + tool_calls + transcripts/analysis + transfer notes) from the
 # source into local, so the calls page has data and the reconciliation/linking path has
 # rows to inspect. duplicate-team stays PII-free; THIS is the opt-in that knowingly brings
 # real call content (transcripts, phone numbers) onto your LOCAL machine only. Recording
@@ -656,6 +656,15 @@ cmd_dup_calls() {
     log "dup-calls team $team ('$name') from $SOURCE_DB — last $since_days days (READ-ONLY)"
   fi
   local callsub="select id from public.calls where $sel"
+  # tool_calls.call_id is text, not uuid like calls.id — needs its own cast
+  # variant of the subquery so the comparison doesn't fail with
+  # "operator does not exist: text = uuid".
+  local callsub_text="select id::text from public.calls where $sel"
+  # Mirrors getToolCallDisplayRows' matching (apps/web/lib/supabase/tool-calls.ts):
+  # a tool_calls row is linked by call_id OR conversation_external_id (the
+  # provider's own VAPI/EL id) — many rows are written mid-call, before the
+  # internal call_id link is populated, so call_id alone misses them.
+  local tool_calls_where="(call_id in ($callsub_text)) or (conversation_external_id in (select coalesce(external_call_id::text, vapi_call_id::text) from public.calls where $sel))"
 
   # idempotent: clear previously-imported rows in scope (children first; replica =>
   # order-free). --call-id is ADDITIVE — only that one call's rows are cleared/
@@ -665,6 +674,7 @@ cmd_dup_calls() {
     lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
 delete from public.transfer_destination_logs where source_call_id in ($callsub) or received_call_id in ($callsub);
+delete from public.tool_calls          where $tool_calls_where;
 delete from public.call_conversations where call_id in ($callsub);
 delete from public.call_analysis      where call_id in ($callsub);
 delete from public.calls              where id in ($callsub);
@@ -673,6 +683,7 @@ SQL
     lsql -q >/dev/null 2>&1 <<SQL
 set session_replication_role = replica;
 delete from public.transfer_destination_logs where source_call_id in (select id from public.calls where team_id=$team) or received_call_id in (select id from public.calls where team_id=$team);
+delete from public.tool_calls          where call_id in (select id::text from public.calls where team_id=$team) or conversation_external_id in (select coalesce(external_call_id::text, vapi_call_id::text) from public.calls where team_id=$team);
 delete from public.call_conversations where call_id in (select id from public.calls where team_id=$team);
 delete from public.call_analysis      where call_id in (select id from public.calls where team_id=$team);
 delete from public.calls              where team_id=$team;
@@ -683,6 +694,7 @@ SQL
   # parents first (logging only; replica role makes FK order irrelevant)
   _pull "$url" call_flows "team_id=$team and id in (select call_flow_id from public.calls where $sel and call_flow_id is not null)"
   _pull "$url" calls                     "$sel"
+  _pull "$url" tool_calls                "$tool_calls_where"
   _pull "$url" call_conversations        "call_id in ($callsub)"
   _pull "$url" call_analysis             "call_id in ($callsub)"
   _pull "$url" transfer_destination_logs "source_call_id in ($callsub) or received_call_id in ($callsub)"
