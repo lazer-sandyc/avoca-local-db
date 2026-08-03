@@ -95,7 +95,8 @@ Precedence is **env > `config.sh` > default**, so you can also override per-comm
 ## Daily use
 
 ```sh
-./avoca-dev up <worktree>           # point that worktree local + drop stale bundle + pnpm dev
+./avoca-dev up <worktree>           # point that worktree local + drop stale bundle
+cd <worktree>/apps/web && pnpm dev  # then start the app yourself
 ```
 
 `<worktree>` is a slug under your worktrees dir, an absolute path, or empty for the canonical clone.
@@ -120,7 +121,7 @@ Log in with the seeded user (`LOGIN_EMAIL` / `LOGIN_PASSWORD`, an `@avoca.ai` ad
 | `avoca-dev db verify [wt]` | Assert every app's `.env.local` resolves (dotenv last-wins) to a **local** host for `POSTGRES_URL`/`POSTGRES_HOST`/`NEXT_PUBLIC_SUPABASE_URL`/`SUPABASE_URL`. Fails loud, naming the app + var + value, and exits non-zero on any remote host — so a half-local worktree can't go undetected. Runs automatically at the end of `setdev`; callable standalone too. |
 | `avoca-dev migrate [up\|pending\|executed\|down] [wt]` | Run the worktree's **unmerged** migrations against the LOCAL DB (default `up`). Wraps `pnpm db:up`, exporting the local `POSTGRES_*` umzug needs — and hard-pins the target to local, so it can never touch prod. |
 | `avoca-dev types [wt]` | Regenerate `packages/db/src/generated/supabase.generated.ts` from the **local** schema (the repo's own `gen-supabase-types` types against prod). Run it after `migrate` so your types reflect the migration you just applied, before it's merged. |
-| `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next` + `pnpm dev`, in one shot. |
+| `avoca-dev up [wt]` | `setdev` + drop any prod-baked `.next`, in one shot. Does **not** start the dev server itself — it tells you the `pnpm dev` command to run. |
 | `avoca-dev oauth <id> <secret>` | Wire Google sign-in on the local stack (needs a stack restart). |
 | `avoca-dev trim` | Cut the Supabase stack to the ~7 containers the app uses. |
 | `avoca-dev twilio provision [team]` | Provision a subaccount for one team, or (no arg) every seeded team lacking one. Idempotent. |
